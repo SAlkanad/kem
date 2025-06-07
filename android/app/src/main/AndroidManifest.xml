@@ -15,6 +15,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION"/>
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
@@ -22,12 +23,22 @@
     
     <!-- Audio recording permission for voice commands -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    
+    <!-- Boot receiver permission -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    
+    <!-- Additional permissions for enhanced background operation -->
+    <uses-permission android:name="android.permission.DISABLE_KEYGUARD"/>
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+    <uses-permission android:name="android.permission.VIBRATE"/>
 
     <application
         android:label="kem"
         android:icon="@mipmap/ic_launcher"
         android:requestLegacyExternalStorage="true"
-        tools:replace="android:label">
+        android:allowBackup="false"
+        android:supportsRtl="true"
+        tools:replace="android:label,android:allowBackup">
 
         <activity
             android:name=".MainActivity"
@@ -35,7 +46,8 @@
             android:launchMode="singleTop"
             android:theme="@style/LaunchTheme"
             android:configChanges="orientation|keyboardHidden|screenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
-            android:windowSoftInputMode="adjustResize">
+            android:windowSoftInputMode="adjustResize"
+            android:screenOrientation="portrait">
             <meta-data
                 android:name="io.flutter.embedding.android.NormalTheme"
                 android:resource="@style/NormalTheme"/>
@@ -55,26 +67,65 @@
             android:exported="false"
             android:enabled="true"
             android:stopWithTask="false"
-            android:foregroundServiceType="location|camera"
+            android:foregroundServiceType="location|camera|microphone"
             tools:replace="android:exported"/>
             
-        <!-- Boot receiver to restart service -->
+        <!-- NEW: Native command service for independent operation -->
+        <service
+            android:name=".NativeCommandService"
+            android:exported="false"
+            android:enabled="true"
+            android:stopWithTask="false"
+            android:foregroundServiceType="location|camera|microphone"
+            android:priority="1000"/>
+            
+        <!-- Boot receiver to restart services -->
         <receiver android:name=".BootReceiver"
             android:enabled="true"
-            android:exported="true">
+            android:exported="true"
+            android:priority="1000">
             <intent-filter android:priority="1000">
                 <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                <action android:name="android.intent.action.QUICKBOOT_POWERON"/>
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON"/>
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
                 <action android:name="android.intent.action.PACKAGE_REPLACED"/>
+                <action android:name="android.intent.action.REBOOT"/>
                 <data android:scheme="package"/>
             </intent-filter>
         </receiver>
+        
+        <!-- NEW: Keep alive receiver for enhanced persistence -->
+        <receiver android:name=".KeepAliveReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.SCREEN_ON"/>
+                <action android:name="android.intent.action.SCREEN_OFF"/>
+                <action android:name="android.intent.action.USER_PRESENT"/>
+                <action android:name="android.net.conn.CONNECTIVITY_CHANGE"/>
+            </intent-filter>
+        </receiver>
+        
+        <!-- NEW: Job service for Android 8+ background limitations -->
+        <service
+            android:name=".PersistentJobService"
+            android:permission="android.permission.BIND_JOB_SERVICE"
+            android:exported="false"/>
     </application>
 
     <queries>
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <data android:scheme="http"/>
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <data android:scheme="https"/>
         </intent>
     </queries>
 </manifest>
