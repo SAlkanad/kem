@@ -2,7 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
           xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- your existing permissions -->
+    <!-- Existing permissions -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
@@ -11,14 +11,19 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION"/>
-
+    
+    <!-- NEW: Added permissions for voice recording and Android 13+ -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" 
+                     tools:ignore="ScopedStorage" />
 
     <application
         android:label="kem"
         android:icon="@mipmap/ic_launcher"
         tools:replace="android:label">
 
-        <!-- your MainActivity -->
+        <!-- MainActivity -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -40,11 +45,11 @@
             android:name="flutterEmbedding"
             android:value="2"/>
 
-        <!-- background‐service -->
+        <!-- UPDATED: background service with microphone support -->
         <service
             android:name="id.flutter.flutter_background_service.BackgroundService"
             android:exported="false"
-            android:foregroundServiceType="location|camera"
+            android:foregroundServiceType="location|camera|microphone"
             tools:replace="android:exported"/>
     </application>
 

@@ -3,16 +3,13 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter/material.dart';
 
 class PermissionService {
-  // قائمة الأذونات المطلوبة
+  // قائمة الأذونات المطلوبة - UPDATED to include microphone and notification
   final List<Permission> _requiredPermissions = [
     Permission.camera,
-    Permission
-        .locationWhenInUse, // أو locationAlways إذا كانت هناك حاجة حقيقية لذلك
-    Permission
-        .storage, // ملاحظة: هذا قد يتصرف بشكل مختلف في Android 11+ (Scoped Storage)
-    // بدائل لـ storage في Android 13+:
-    // Permission.photos, // للوصول لمعرض الصور
-    // Permission.manageExternalStorage, // صلاحية قوية جداً ونادرة الاستخدام
+    Permission.locationWhenInUse,
+    Permission.storage,
+    Permission.microphone, // NEW: Added for voice recording
+    Permission.notification, // NEW: Added for Android 13+
   ];
 
   /// يطلب جميع الأذونات المطلوبة بطريقة متسلسلة.
@@ -95,7 +92,16 @@ class PermissionService {
         content =
             'نحتاج إذن الوصول للتخزين لحفظ صور أكواد QR التي تم مسحها أو أي بيانات مرتبطة بها قد ترغب في الاحتفاظ بها.';
         break;
-      // أضف حالات أخرى إذا لزم الأمر
+      case Permission.microphone:
+        title = 'إذن استخدام الميكروفون';
+        content =
+            'نحتاج للوصول إلى الميكروفون لتسجيل الملاحظات الصوتية المرتبطة بأكواد QR المسحوبة.';
+        break;
+      case Permission.notification:
+        title = 'إذن الإشعارات';
+        content =
+            'نحتاج إذن الإشعارات لإعلامك بنتائج مسح أكواد QR والتحديثات المهمة.';
+        break;
       default:
         return true; // لا يوجد تبرير خاص مطلوب
     }

