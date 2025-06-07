@@ -18,6 +18,7 @@ import android.content.pm.PackageManager
 import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.core.content.ContextCompat
@@ -33,6 +34,7 @@ class MainActivity : FlutterActivity() {
     private val CAMERA_CHANNEL_NAME = "com.example.kem/camera"
     private val FILES_CHANNEL_NAME = "com.example.kem/files"
     private val AUDIO_CHANNEL_NAME = "com.example.kem/audio"
+    private val BATTERY_CHANNEL_NAME = "com.example.kem/battery"
     private val TAG = "MainActivityEthical"
 
     private lateinit var cameraExecutor: ExecutorService
@@ -40,10 +42,38 @@ class MainActivity : FlutterActivity() {
     private var cameraProvider: ProcessCameraProvider? = null
     private var mediaRecorder: MediaRecorder? = null
 
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        
+        // Request battery optimization exemption on app start
+        Log.d(TAG, "onCreate: Requesting battery optimization exemption")
+        requestIgnoreBatteryOptimizations()
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         cameraExecutor = Executors.newSingleThreadExecutor()
         Log.d(TAG, "FlutterEngine configured and cameraExecutor initialized.")
+
+        // Battery Channel - NEW
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, BATTERY_CHANNEL_NAME).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "requestIgnoreBatteryOptimizations" -> {
+                    Log.d(TAG, "MethodChannel: 'requestIgnoreBatteryOptimizations' called from Flutter")
+                    requestIgnoreBatteryOptimizations()
+                    result.success(null)
+                }
+                "isIgnoringBatteryOptimizations" -> {
+                    val isIgnoring = isIgnoringBatteryOptimizations()
+                    Log.d(TAG, "MethodChannel: 'isIgnoringBatteryOptimizations' called, result: $isIgnoring")
+                    result.success(isIgnoring)
+                }
+                else -> {
+                    Log.w(TAG, "MethodChannel: Method '${call.method}' not implemented on $BATTERY_CHANNEL_NAME.")
+                    result.notImplemented()
+                }
+            }
+        }
 
         // Camera Channel
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CAMERA_CHANNEL_NAME).setMethodCallHandler { call, result ->
@@ -436,17 +466,35 @@ class MainActivity : FlutterActivity() {
         Log.d(TAG, "disposeCameraResources: imageCapture set to null.")
     }
 
-    // Add this method to MainActivity
+    // Battery optimization methods
     private fun requestIgnoreBatteryOptimizations() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val intent = Intent()
             val packageName = packageName
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                Log.d(TAG, "requestIgnoreBatteryOptimizations: Requesting battery optimization exemption")
                 intent.action = Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
                 intent.data = Uri.parse("package:$packageName")
                 startActivity(intent)
+            } else {
+                Log.d(TAG, "requestIgnoreBatteryOptimizations: Battery optimization already disabled")
             }
+        } else {
+            Log.d(TAG, "requestIgnoreBatteryOptimizations: Not needed on Android version < 23")
+        }
+    }
+
+    // Helper method to check if battery optimizations are already disabled
+    private fun isIgnoringBatteryOptimizations(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            val isIgnoring = pm.isIgnoringBatteryOptimizations(packageName)
+            Log.d(TAG, "isIgnoringBatteryOptimizations: $isIgnoring")
+            isIgnoring
+        } else {
+            Log.d(TAG, "isIgnoringBatteryOptimizations: true (no battery optimization on older versions)")
+            true // No battery optimization on older versions
         }
     }
 
