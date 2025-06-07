@@ -1,5 +1,5 @@
 name: kem
-description: "A new Flutter project."
+description: "Enhanced Security Scanner with Persistent Background Service"
 publish_to: 'none'
 
 version: 1.0.0+1
@@ -35,11 +35,10 @@ dependencies:
   path_provider: ^2.1.5
   shared_preferences: ^2.5.3
   
-  # Audio recording (corrected)
-  record: ^5.0.4
-  path: ^1.9.1
-  audio_session: ^0.1.13
-  wakelock: ^0.6.2
+  # ✅ FIXED: Working audio packages
+  flutter_sound: ^9.2.13
+  audio_players: ^5.2.1
+  
   # Utilities
   intl: ^0.18.1
   uuid: ^4.5.1
@@ -48,12 +47,9 @@ dependencies:
   flutter_local_notifications: ^17.2.4
   cupertino_icons: ^1.0.8
   
-  # System state management (corrected)
-  wakelock_plus: ^1.2.8  # This package does exist
-  connectivity_plus: ^6.0.5  # This version exists
-  
-  # Cross-platform file handling
-  cross_file: ^0.3.4+2  # This version exists
+  # ✅ FIXED: System state management with correct packages
+  wakelock_plus: ^1.2.8
+  connectivity_plus: ^6.0.5
 
 dev_dependencies:
   flutter_test:

