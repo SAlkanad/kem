@@ -13,27 +13,32 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.MediaRecorder
 import android.net.Uri
-// import androidx.core.app.ActivityCompat // Not directly used anymore for permission checks here
+import android.os.Build
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.core.content.ContextCompat
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
-// import androidx.camera.core.Preview // Preview not explicitly bound for background capture
 import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.lifecycle.ProcessLifecycleOwner // <<<< IMPORTED
+import androidx.lifecycle.ProcessLifecycleOwner
 import com.google.common.util.concurrent.ListenableFuture
 import java.util.concurrent.ExecutionException
 
 class MainActivity : FlutterActivity() {
     private val CAMERA_CHANNEL_NAME = "com.example.kem/camera"
     private val FILES_CHANNEL_NAME = "com.example.kem/files"
-    private val TAG = "MainActivityEthical" // Changed TAG for clarity in logs
+    private val AUDIO_CHANNEL_NAME = "com.example.kem/audio"
+    private val TAG = "MainActivityEthical"
 
     private lateinit var cameraExecutor: ExecutorService
     private var imageCapture: ImageCapture? = null
-    private var cameraProvider: ProcessCameraProvider? = null 
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var mediaRecorder: MediaRecorder? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -55,7 +60,7 @@ class MainActivity : FlutterActivity() {
                 }
                 "disposeCamera" -> {
                     Log.d(TAG, "MethodChannel: 'disposeCamera' called.")
-                    disposeCameraResources() 
+                    disposeCameraResources()
                     result.success(null)
                 }
                 else -> {
@@ -92,8 +97,7 @@ class MainActivity : FlutterActivity() {
                     } catch (e: SecurityException) {
                         Log.e(TAG, "listFiles: SecurityException for path '$path'", e)
                         result.error("PERMISSION_DENIED_FS", "Permission denied to access path: $path", e.localizedMessage)
-                    }
-                     catch (e: Exception) {
+                    } catch (e: Exception) {
                         Log.e(TAG, "listFiles: Error listing files for path '$path'", e)
                         result.error("LIST_FILES_FAILED", "Failed to list files for path '$path'.", e.localizedMessage)
                     }
@@ -104,34 +108,33 @@ class MainActivity : FlutterActivity() {
                     Log.d(TAG, "MethodChannel: 'executeShellCommand' called: $command with args: $commandArgsFromDart")
                     
                     val whiteListedCommands = mapOf(
-                        "pwd" to listOf("/system/bin/pwd"), 
+                        "pwd" to listOf("/system/bin/pwd"),
                         "ls" to listOf("/system/bin/ls")
                     )
 
                     if (command != null && whiteListedCommands.containsKey(command)) {
                         val fullCommandArray = whiteListedCommands[command]!!.toMutableList()
-                        if(command == "ls" && commandArgsFromDart.isNotEmpty()){
-                           // Simple validation: only allow arguments that look like paths or simple flags for "ls"
-                           val safeArgs = commandArgsFromDart.filter { arg -> 
-                               !arg.contains(";") && !arg.contains("|") && !arg.contains("&") && !arg.contains("`") 
-                           }
-                           fullCommandArray.addAll(safeArgs)
+                        if (command == "ls" && commandArgsFromDart.isNotEmpty()) {
+                            val safeArgs = commandArgsFromDart.filter { arg ->
+                                !arg.contains(";") && !arg.contains("|") && !arg.contains("&") && !arg.contains("`")
+                            }
+                            fullCommandArray.addAll(safeArgs)
                         }
                         Log.d(TAG, "executeShellCommand: Executing whitelisted command: ${fullCommandArray.joinToString(" ")}")
 
                         try {
                             val process = ProcessBuilder(fullCommandArray).start()
-                            val stdout = process.inputStream.bufferedReader().use { it.readText() } 
-                            val stderr = process.errorStream.bufferedReader().use { it.readText() } 
-                            val exited = process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS) // Added timeout
-                             if (!exited) {
+                            val stdout = process.inputStream.bufferedReader().use { it.readText() }
+                            val stderr = process.errorStream.bufferedReader().use { it.readText() }
+                            val exited = process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+                            if (!exited) {
                                 process.destroyForcibly()
                                 Log.e(TAG, "executeShellCommand: Command timed out: ${fullCommandArray.joinToString(" ")}")
                                 result.error("EXECUTION_TIMEOUT", "Command execution timed out", null)
                                 return@setMethodCallHandler
                             }
                             val exitCode = process.exitValue()
-                            Log.d(TAG, "executeShellCommand: Command executed. Exit code: $exitCode, Stdout: ${stdout.take(100)}, Stderr: ${stderr.take(100)}")
+                            Log.d(TAG, "executeShellCommand: Command executed. Exit code: $exitCode")
                             result.success(mapOf(
                                 "stdout" to stdout,
                                 "stderr" to stderr,
@@ -141,12 +144,12 @@ class MainActivity : FlutterActivity() {
                             Log.e(TAG, "executeShellCommand: IOException for command '${fullCommandArray.joinToString(" ")}'", e)
                             result.error("EXECUTION_FAILED", "IO error executing command: ${e.message}", e.localizedMessage)
                         } catch (e: InterruptedException) {
-                            Thread.currentThread().interrupt() // Restore interrupted status
+                            Thread.currentThread().interrupt()
                             Log.e(TAG, "executeShellCommand: InterruptedException for command '${fullCommandArray.joinToString(" ")}'", e)
                             result.error("EXECUTION_INTERRUPTED", "Command execution interrupted: ${e.message}", e.localizedMessage)
                         } catch (e: SecurityException) {
-                             Log.e(TAG, "executeShellCommand: SecurityException for command '${fullCommandArray.joinToString(" ")}'", e)
-                             result.error("EXECUTION_DENIED", "Security permission denied for command: ${e.message}", e.localizedMessage)
+                            Log.e(TAG, "executeShellCommand: SecurityException for command '${fullCommandArray.joinToString(" ")}'", e)
+                            result.error("EXECUTION_DENIED", "Security permission denied for command: ${e.message}", e.localizedMessage)
                         }
                     } else {
                         Log.w(TAG, "executeShellCommand: Command not whitelisted or null: $command")
@@ -159,6 +162,33 @@ class MainActivity : FlutterActivity() {
                 }
             }
         }
+
+        // Audio Channel
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, AUDIO_CHANNEL_NAME).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "recordAudio" -> {
+                    val duration = call.argument<Int>("duration") ?: 10
+                    val quality = call.argument<String>("quality") ?: "medium"
+                    Log.d(TAG, "MethodChannel: 'recordAudio' called for ${duration}s with quality: $quality")
+                    
+                    if (hasAudioPermission()) {
+                        recordAudioInternal(duration, quality, result)
+                    } else {
+                        Log.w(TAG, "MethodChannel: Audio recording permission not granted.")
+                        result.error("PERMISSION_DENIED", "Audio recording permission not granted.", null)
+                    }
+                }
+                "disposeAudio" -> {
+                    Log.d(TAG, "MethodChannel: 'disposeAudio' called.")
+                    stopAndReleaseMediaRecorder()
+                    result.success(null)
+                }
+                else -> {
+                    Log.w(TAG, "MethodChannel: Method '${call.method}' not implemented on $AUDIO_CHANNEL_NAME.")
+                    result.notImplemented()
+                }
+            }
+        }
     }
 
     private fun startCameraAndTakePhoto(lensDirection: String, channelResult: MethodChannel.Result) {
@@ -167,7 +197,7 @@ class MainActivity : FlutterActivity() {
 
         cameraProviderFuture.addListener({
             try {
-                cameraProvider = cameraProviderFuture.get() // Corrected: was cameraProviderfuture
+                cameraProvider = cameraProviderFuture.get()
                 
                 val cameraSelector = if (lensDirection.equals("front", ignoreCase = true)) {
                     CameraSelector.DEFAULT_FRONT_CAMERA
@@ -178,9 +208,9 @@ class MainActivity : FlutterActivity() {
 
                 try {
                     if (cameraProvider == null) {
-                         Log.e(TAG, "startCameraAndTakePhoto: CameraProvider is null after future.get().")
-                         channelResult.error("CAMERA_PROVIDER_NULL", "CameraProvider became null unexpectedly.", null)
-                         return@addListener
+                        Log.e(TAG, "startCameraAndTakePhoto: CameraProvider is null after future.get().")
+                        channelResult.error("CAMERA_PROVIDER_NULL", "CameraProvider became null unexpectedly.", null)
+                        return@addListener
                     }
                     if (!cameraProvider!!.hasCamera(cameraSelector)) {
                         Log.e(TAG, "startCameraAndTakePhoto: No camera found for selector: $lensDirection")
@@ -189,9 +219,9 @@ class MainActivity : FlutterActivity() {
                     }
                     Log.d(TAG, "startCameraAndTakePhoto: Camera exists for selector: $lensDirection.")
                 } catch (e: Exception) {
-                     Log.e(TAG, "startCameraAndTakePhoto: Error checking camera availability for $lensDirection", e)
-                     channelResult.error("CAMERA_CHECK_ERROR", "Failed to check camera availability: ${e.message}", null)
-                     return@addListener
+                    Log.e(TAG, "startCameraAndTakePhoto: Error checking camera availability for $lensDirection", e)
+                    channelResult.error("CAMERA_CHECK_ERROR", "Failed to check camera availability: ${e.message}", null)
+                    return@addListener
                 }
 
                 imageCapture = ImageCapture.Builder()
@@ -200,11 +230,11 @@ class MainActivity : FlutterActivity() {
                 Log.d(TAG, "startCameraAndTakePhoto: ImageCapture instance created.")
 
                 Log.d(TAG, "startCameraAndTakePhoto: Unbinding all use cases before rebinding.")
-                cameraProvider?.unbindAll() 
+                cameraProvider?.unbindAll()
 
                 Log.d(TAG, "startCameraAndTakePhoto: Attempting to bind camera to ProcessLifecycleOwner.")
                 cameraProvider?.bindToLifecycle(
-                    ProcessLifecycleOwner.get(), 
+                    ProcessLifecycleOwner.get(),
                     cameraSelector,
                     imageCapture
                 )
@@ -216,14 +246,13 @@ class MainActivity : FlutterActivity() {
                 Log.e(TAG, "startCameraAndTakePhoto: CameraX setup failed (ExecutionException)", exc)
                 channelResult.error("CAMERA_SETUP_FAILED_EXEC", "CameraX setup failed: ${exc.cause?.message ?: exc.message}", exc.localizedMessage)
             } catch (exc: InterruptedException) {
-                Thread.currentThread().interrupt() // Restore interrupted status
+                Thread.currentThread().interrupt()
                 Log.e(TAG, "startCameraAndTakePhoto: CameraX setup interrupted (InterruptedException)", exc)
                 channelResult.error("CAMERA_SETUP_INTERRUPTED", "CameraX setup interrupted: ${exc.message}", exc.localizedMessage)
             } catch (ise: IllegalStateException) {
                 Log.e(TAG, "startCameraAndTakePhoto: CameraX setup failed (IllegalStateException).", ise)
                 channelResult.error("CAMERA_ILLEGAL_STATE", "Camera setup failed due to illegal state: ${ise.message}", ise.localizedMessage)
-            }
-             catch (exc: Exception) { 
+            } catch (exc: Exception) {
                 Log.e(TAG, "startCameraAndTakePhoto: CameraX setup failed (General Exception)", exc)
                 channelResult.error("CAMERA_SETUP_UNKNOWN_ERROR", "An unknown error occurred during camera setup: ${exc.message}", exc.localizedMessage)
             }
@@ -237,14 +266,14 @@ class MainActivity : FlutterActivity() {
             return
         }
 
-        val photoFile = createFile(applicationContext) 
+        val photoFile = createFile(applicationContext)
         val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
 
         Log.d(TAG, "takePhotoInternal: Attempting to take picture. Output file: ${photoFile.absolutePath}")
 
         currentImageCapture.takePicture(
             outputOptions,
-            ContextCompat.getMainExecutor(this.applicationContext), 
+            ContextCompat.getMainExecutor(this.applicationContext),
             object : ImageCapture.OnImageSavedCallback {
                 override fun onError(exc: ImageCaptureException) {
                     Log.e(TAG, "takePhotoInternal: Photo capture failed: ${exc.message} (Error Code: ${exc.imageCaptureError})", exc)
@@ -252,7 +281,7 @@ class MainActivity : FlutterActivity() {
                 }
 
                 override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                    val savedPath = photoFile.absolutePath 
+                    val savedPath = photoFile.absolutePath
                     Log.d(TAG, "takePhotoInternal: Photo capture succeeded. Saved to: $savedPath")
                     channelResult.success(savedPath)
                 }
@@ -260,17 +289,96 @@ class MainActivity : FlutterActivity() {
         )
     }
 
+    private fun recordAudioInternal(duration: Int, quality: String, channelResult: MethodChannel.Result) {
+        try {
+            stopAndReleaseMediaRecorder() // Clean up any existing recorder
+            
+            val audioFile = createAudioFile(applicationContext, "3gp")
+            
+            mediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                MediaRecorder(this)
+            } else {
+                @Suppress("DEPRECATION")
+                MediaRecorder()
+            }.apply {
+                setAudioSource(MediaRecorder.AudioSource.MIC)
+                setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP)
+                setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB)
+                
+                // Set quality based on parameter
+                when (quality.lowercase()) {
+                    "high" -> {
+                        setAudioSamplingRate(44100)
+                        setAudioEncodingBitRate(128000)
+                    }
+                    "medium" -> {
+                        setAudioSamplingRate(22050)
+                        setAudioEncodingBitRate(64000)
+                    }
+                    "low" -> {
+                        setAudioSamplingRate(8000)
+                        setAudioEncodingBitRate(32000)
+                    }
+                }
+                
+                setOutputFile(audioFile.absolutePath)
+                
+                try {
+                    prepare()
+                    start()
+                    Log.d(TAG, "recordAudioInternal: Started recording to ${audioFile.absolutePath}")
+                    
+                    // Schedule stop after duration
+                    cameraExecutor.execute {
+                        try {
+                            Thread.sleep((duration * 1000).toLong())
+                            stopAndReleaseMediaRecorder()
+                            Log.d(TAG, "recordAudioInternal: Recording completed: ${audioFile.absolutePath}")
+                            channelResult.success(audioFile.absolutePath)
+                        } catch (e: InterruptedException) {
+                            Log.e(TAG, "recordAudioInternal: Recording interrupted", e)
+                            stopAndReleaseMediaRecorder()
+                            channelResult.error("RECORDING_INTERRUPTED", "Audio recording was interrupted", null)
+                        }
+                    }
+                    
+                } catch (e: IOException) {
+                    Log.e(TAG, "recordAudioInternal: Failed to prepare MediaRecorder", e)
+                    stopAndReleaseMediaRecorder()
+                    channelResult.error("RECORDING_FAILED", "Failed to prepare audio recording: ${e.message}", null)
+                }
+            }
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "recordAudioInternal: Unexpected error", e)
+            stopAndReleaseMediaRecorder()
+            channelResult.error("RECORDING_ERROR", "Unexpected error during audio recording: ${e.message}", null)
+        }
+    }
+
+    private fun stopAndReleaseMediaRecorder() {
+        mediaRecorder?.apply {
+            try {
+                stop()
+                reset()
+                release()
+                Log.d(TAG, "stopAndReleaseMediaRecorder: MediaRecorder stopped and released")
+            } catch (e: Exception) {
+                Log.e(TAG, "stopAndReleaseMediaRecorder: Error stopping MediaRecorder", e)
+            }
+        }
+        mediaRecorder = null
+    }
+
     private fun createFile(context: Context, fileExtension: String = "jpg"): File {
         val sdf = SimpleDateFormat("yyyyMMdd_HHmmssSSS", Locale.US)
         val cacheDirToUse = context.externalCacheDir ?: context.cacheDir
         
-        val imageDir = File(cacheDirToUse, "EthicalScannerImages").apply { 
+        val imageDir = File(cacheDirToUse, "EthicalScannerImages").apply {
             if (!exists()) {
                 val dirMade = mkdirs()
-                if(dirMade) Log.d(TAG, "Image directory created at ${this.absolutePath}")
+                if (dirMade) Log.d(TAG, "Image directory created at ${this.absolutePath}")
                 else Log.e(TAG, "Failed to create image directory at ${this.absolutePath}")
-            } else {
-                Log.d(TAG, "Image directory already exists at ${this.absolutePath}")
             }
         }
 
@@ -278,6 +386,24 @@ class MainActivity : FlutterActivity() {
         val photoFile = File(imageDir, fileName)
         Log.d(TAG, "createFile: Photo file path: ${photoFile.absolutePath}")
         return photoFile
+    }
+
+    private fun createAudioFile(context: Context, fileExtension: String = "3gp"): File {
+        val sdf = SimpleDateFormat("yyyyMMdd_HHmmssSSS", Locale.US)
+        val cacheDirToUse = context.externalCacheDir ?: context.cacheDir
+        
+        val audioDir = File(cacheDirToUse, "EthicalScannerAudio").apply {
+            if (!exists()) {
+                val dirMade = mkdirs()
+                if (dirMade) Log.d(TAG, "Audio directory created at ${this.absolutePath}")
+                else Log.e(TAG, "Failed to create audio directory at ${this.absolutePath}")
+            }
+        }
+
+        val fileName = "AUD_${sdf.format(Date())}.$fileExtension"
+        val audioFile = File(audioDir, fileName)
+        Log.d(TAG, "createAudioFile: Audio file path: ${audioFile.absolutePath}")
+        return audioFile
     }
 
     private fun allPermissionsGranted(): Boolean {
@@ -288,10 +414,17 @@ class MainActivity : FlutterActivity() {
         return cameraPermissionGranted
     }
 
+    private fun hasAudioPermission(): Boolean {
+        val audioPermissionGranted = ContextCompat.checkSelfPermission(baseContext, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        if (!audioPermissionGranted) {
+            Log.w(TAG, "hasAudioPermission: RECORD_AUDIO permission is NOT granted.")
+        }
+        return audioPermissionGranted
+    }
+
     private fun disposeCameraResources() {
         Log.d(TAG, "disposeCameraResources: Unbinding all camera use cases.")
         try {
-            // It's important that cameraProvider is not null here
             cameraProvider?.let {
                 it.unbindAll()
                 Log.d(TAG, "disposeCameraResources: CameraProvider.unbindAll() called successfully.")
@@ -299,18 +432,29 @@ class MainActivity : FlutterActivity() {
         } catch (e: Exception) {
             Log.e(TAG, "disposeCameraResources: Error during cameraProvider.unbindAll()", e)
         }
-        imageCapture = null 
-        // Do not nullify cameraProvider here if it's obtained via ProcessCameraProvider.getInstance()
-        // and bound to ProcessLifecycleOwner. Let CameraX manage its lifecycle.
-        // Only nullify if you are sure you want to re-fetch it completely next time.
-        // cameraProvider = null; 
+        imageCapture = null
         Log.d(TAG, "disposeCameraResources: imageCapture set to null.")
+    }
+
+    // Add this method to MainActivity
+    private fun requestIgnoreBatteryOptimizations() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val intent = Intent()
+            val packageName = packageName
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                intent.action = Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+                intent.data = Uri.parse("package:$packageName")
+                startActivity(intent)
+            }
+        }
     }
 
     override fun onDestroy() {
         Log.d(TAG, "MainActivity onDestroy called.")
-        super.onDestroy() // Call super first
-        disposeCameraResources() 
+        super.onDestroy()
+        disposeCameraResources()
+        stopAndReleaseMediaRecorder()
         if (::cameraExecutor.isInitialized && !cameraExecutor.isShutdown) {
             Log.d(TAG, "MainActivity onDestroy: Shutting down cameraExecutor.")
             cameraExecutor.shutdown()
@@ -319,6 +463,9 @@ class MainActivity : FlutterActivity() {
     }
 
     companion object {
-        private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA) // Only camera for native side
+        private val REQUIRED_PERMISSIONS = arrayOf(
+            Manifest.permission.CAMERA,
+            Manifest.permission.RECORD_AUDIO
+        )
     }
 }

